@@ -43,7 +43,7 @@ engine:
   poll_interval_secs: 2
   game_state_interval_secs: 10
   pregame_game_state_window_secs: 1800 # only poll game state within 30 min of first pitch
-  discovery_interval_secs: 120
+  discovery_interval_secs: 1800
   equity_snapshot_secs: 60
   slippage: 0.005
   db_path: polybot.db

@@ -65,7 +65,7 @@ class EngineConfig:
     poll_interval_secs: float = 2.0
     game_state_interval_secs: float = 10.0
     pregame_game_state_window_secs: float = 1800.0  # start live-state checks 30 min pregame
-    discovery_interval_secs: float = 120.0
+    discovery_interval_secs: float = 1800.0
     equity_snapshot_secs: float = 60.0
     slippage: float = 0.005              # paper fill: mid +/- this
     live: bool = False
