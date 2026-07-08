@@ -1,0 +1,8 @@
+requests>=2.31
+PyYAML>=6.0
+python-dotenv>=1.0
+anthropic>=0.50
+pytest>=8.0
+
+# Uncomment for live trading:
+# py-clob-client>=0.17

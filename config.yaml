@@ -1,0 +1,40 @@
+# Polybot configuration. Every value here overrides the defaults in
+# polybot/config.py; delete a line to fall back to the default.
+
+strategy:
+  move_lookback_secs: 90      # window for detecting a sharp move
+  move_threshold: 0.08        # min |price change| over the window (8 cents)
+  min_edge: 0.05              # model must disagree with the move by >= this
+  min_price: 0.10             # never buy tokens priced below
+  max_price: 0.85             # or above
+  take_profit: 0.12           # +12% -> close (your 5-30% band; tune here)
+  stop_loss: 0.10             # -10% -> close
+  max_hold_secs: 900          # 15 min time stop
+  edge_exit: 0.03             # close if model edge flips against us
+  cooldown_secs: 120          # per-market cooldown between trades
+  min_flips: 2                # "playful game" filter: 0.5-crossings needed...
+  flip_band: 0.03             #   ...beyond this band around 0.5
+  min_volatility: 0.015       # OR realized vol >= this
+  vol_window: 30
+
+risk:
+  stake_usd: 10               # notional per trade
+  max_positions: 3            # concurrent positions per strategy
+  max_stake_per_market: 20
+  daily_loss_limit_usd: 25    # halt new entries past this realized loss
+  starting_cash: 100          # paper account per strategy
+
+ai:
+  enabled: true               # auto-disabled if ANTHROPIC_API_KEY is missing
+  model: claude-opus-4-8
+  effort: low                 # judge should be fast; raise to medium/high to test
+  min_confidence: 0.55
+  timeout_secs: 20
+
+engine:
+  poll_interval_secs: 2
+  game_state_interval_secs: 10
+  discovery_interval_secs: 120
+  equity_snapshot_secs: 60
+  slippage: 0.005
+  db_path: polybot.db

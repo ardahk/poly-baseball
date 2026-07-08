@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Polybot CLI.
+
+Usage:
+  python main.py run             # paper trade (default)
+  python main.py run --live      # real orders (needs py-clob-client + keys)
+  python main.py scan            # one-shot: show tradeable markets right now
+  python main.py report          # math-vs-AI performance comparison
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+
+from polybot import gamma, mlb
+from polybot.clob import PriceFeed
+from polybot.config import load_config
+from polybot.engine import Engine
+from polybot.report import print_report
+from polybot.winprob import home_win_probability
+
+
+def cmd_run(args, cfg):
+    if args.live:
+        cfg.engine.live = True
+        confirm = input("LIVE trading with real funds. Type 'yes' to continue: ")
+        if confirm.strip().lower() != "yes":
+            print("aborted")
+            return
+    Engine(cfg).run()
+
+
+def cmd_scan(args, cfg):
+    markets = gamma.fetch_mlb_markets()
+    client = mlb.MLBClient()
+    games = client.todays_games()
+    mlb.match_markets_to_games(markets, games)
+    feed = PriceFeed()
+    matched = [m for m in markets if m.game_pk]
+    print(f"{len(markets)} MLB markets found, {len(matched)} matched to today's games\n")
+    for m in matched:
+        gs = client.game_state(m.game_pk)
+        mid = feed.midpoint(m.home_token)
+        line = f"  {m.question:<50}"
+        if mid is not None:
+            line += f" home={mid:.3f}"
+        if gs:
+            line += f" [{gs.status}"
+            if gs.is_live:
+                fair = home_win_probability(gs)
+                half = "T" if gs.is_top else "B"
+                line += (f" {half}{gs.inning} {gs.away_score}-{gs.home_score}"
+                         f" fair={fair:.3f}")
+            line += "]"
+        print(line)
+
+
+def cmd_report(args, cfg):
+    print_report(cfg.engine.db_path, cfg.risk.starting_cash)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="polybot")
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_run = sub.add_parser("run", help="start the trading loop")
+    p_run.add_argument("--live", action="store_true", help="submit real orders")
+    sub.add_parser("scan", help="show current MLB markets and model fair values")
+    sub.add_parser("report", help="print math-vs-AI performance report")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    cfg = load_config(args.config)
+    {"run": cmd_run, "scan": cmd_scan, "report": cmd_report}[args.command](args, cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
