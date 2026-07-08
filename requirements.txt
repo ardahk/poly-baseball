@@ -5,4 +5,4 @@ anthropic>=0.50
 pytest>=8.0
 
 # Uncomment for live trading:
-# py-clob-client>=0.17
+# polymarket-us>=0.1

@@ -1,4 +1,4 @@
-"""Order execution: paper broker (default) and live CLOB broker (guarded)."""
+"""Order execution: paper broker (default) and live Polymarket US broker (guarded)."""
 from __future__ import annotations
 
 import logging
@@ -7,6 +7,14 @@ import os
 from .models import Position
 
 log = logging.getLogger(__name__)
+
+
+def parse_token(token: str) -> tuple[str, str]:
+    """Parse "<market-slug>:LONG" / "<market-slug>:SHORT" into (slug, side)."""
+    slug, sep, side = token.rpartition(":")
+    if not sep or not slug or side not in {"LONG", "SHORT"}:
+        raise ValueError(f"invalid Polymarket US position token: {token!r}")
+    return slug, side
 
 
 class PaperBroker:
@@ -52,6 +60,19 @@ class PaperBroker:
         self.closes[strategy] += 1
         return pos, fill, pnl
 
+    def settle(self, strategy: str, token: str, settlement_price: float) -> tuple[Position, float, float] | None:
+        """Close a paper position at an exact settlement price, with no slippage."""
+        pos = self.positions[strategy].pop(token, None)
+        if pos is None:
+            return None
+        fill = min(max(settlement_price, 0.0), 1.0)
+        proceeds = pos.qty * fill
+        self.cash[strategy] += proceeds
+        pnl = proceeds - pos.cost
+        self.realized[strategy] += pnl
+        self.closes[strategy] += 1
+        return pos, fill, pnl
+
     def equity(self, strategy: str, prices: dict[str, float]) -> float:
         total = self.cash[strategy]
         for token, pos in self.positions[strategy].items():
@@ -67,62 +88,107 @@ class PaperBroker:
 
 
 class LiveBroker(PaperBroker):
-    """Real orders on the Polymarket CLOB. Requires py-clob-client and keys.
+    """Real orders on Polymarket US via the official `polymarket-us` SDK.
 
-    Extends PaperBroker for the local book-keeping; each open/close also
-    submits a real marketable limit order. Fills are assumed at our limit
-    (fill-or-kill semantics would be the next hardening step).
+    Each open/close submits a marketable limit order (aggressive limit,
+    immediate-or-cancel) with synchronous execution, and books the *actual*
+    reported fill price/quantity — not the requested price — so local P&L
+    tracking reflects real slippage rather than an optimistic assumption.
     """
 
     def __init__(self, strategies: list[str], starting_cash: float, slippage: float = 0.01):
         super().__init__(strategies, starting_cash, slippage)
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY, SELL
+            from polymarket_us import PolymarketUS
         except ImportError as exc:
             raise RuntimeError(
-                "Live trading requires py-clob-client: pip install py-clob-client"
+                "Live trading requires the polymarket-us package: pip install polymarket-us"
             ) from exc
-        key = os.environ.get("POLYMARKET_PRIVATE_KEY")
-        funder = os.environ.get("POLYMARKET_FUNDER_ADDRESS")
-        if not key:
+        key_id = os.environ.get("POLYMARKET_KEY_ID")
+        secret_key = os.environ.get("POLYMARKET_SECRET_KEY")
+        if not key_id or not secret_key:
             raise RuntimeError(
-                "Set POLYMARKET_PRIVATE_KEY (and optionally POLYMARKET_FUNDER_ADDRESS) "
-                "in .env for live trading."
+                "Set POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY in .env for live trading "
+                "(from polymarket.us/developer — these are Polymarket US API credentials, "
+                "not offshore Polymarket.com wallet keys)."
             )
-        self._OrderArgs, self._OrderType = OrderArgs, OrderType
-        self._BUY, self._SELL = BUY, SELL
-        self.client = ClobClient(
-            "https://clob.polymarket.com", key=key, chain_id=137,
-            signature_type=1 if funder else 0, funder=funder,
-        )
-        self.client.set_api_creds(self.client.create_or_derive_api_creds())
-        log.info("LiveBroker initialised")
+        self.client = PolymarketUS(key_id=key_id, secret_key=secret_key)
+        log.info("LiveBroker initialised (Polymarket US)")
 
-    def _submit(self, token: str, side, price: float, qty: float) -> bool:
+    _INTENTS = {
+        ("LONG", "BUY"): "ORDER_INTENT_BUY_LONG",
+        ("LONG", "SELL"): "ORDER_INTENT_SELL_LONG",
+        ("SHORT", "BUY"): "ORDER_INTENT_BUY_SHORT",
+        ("SHORT", "SELL"): "ORDER_INTENT_SELL_SHORT",
+    }
+    _FILL_TYPES = {"EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL"}
+
+    def _submit(self, slug: str, side: str, action: str,
+               limit_price: float, qty: float) -> tuple[float, float] | None:
+        """Returns (avg_fill_price, filled_qty), or None if nothing filled."""
+        intent = self._INTENTS[(side, action)]
+        order_qty = max(0.0001, round(qty, 4))
         try:
-            order = self.client.create_order(self._OrderArgs(
-                token_id=token, price=round(price, 3), size=round(qty, 2), side=side,
-            ))
-            resp = self.client.post_order(order, self._OrderType.GTC)
-            log.info("live order: %s", resp)
-            return bool(resp.get("success"))
+            resp = self.client.orders.create({
+                "marketSlug": slug,
+                "intent": intent,
+                "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": f"{limit_price:.4f}", "currency": "USD"},
+                "quantity": order_qty,
+                "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+                "synchronousExecution": True,
+                "maxBlockTime": "5",
+            })
         except Exception as exc:
-            log.error("live order failed: %s", exc)
-            return False
+            log.error("live order failed (%s %s %s): %s", action, side, slug, exc)
+            return None
+        fills = [e for e in resp.get("executions", []) if e.get("type") in self._FILL_TYPES]
+        if not fills:
+            log.warning("no fill for order %s (%s %s %s)", resp.get("id"), action, side, slug)
+            return None
+        filled_qty = sum(float(e["lastShares"]) for e in fills)
+        if filled_qty <= 0:
+            return None
+        notional = sum(float(e["lastShares"]) * float(e["lastPx"]["value"]) for e in fills)
+        return notional / filled_qty, filled_qty
 
     def open(self, strategy, market_key, token, team, price, stake_usd):
-        limit = min(price + self.slippage, 0.999)
-        if not self._submit(token, self._BUY, limit, stake_usd / limit):
+        if token in self.positions[strategy]:
             return None
-        return super().open(strategy, market_key, token, team, price, stake_usd)
+        slug, side = parse_token(token)
+        limit = min(price + self.slippage, 0.999)
+        result = self._submit(slug, side, "BUY", limit, stake_usd / limit)
+        if result is None:
+            return None
+        fill_price, filled_qty = result
+        self.cash[strategy] -= filled_qty * fill_price
+        pos = Position(strategy=strategy, market_key=market_key, token=token,
+                       team=team, qty=filled_qty, entry_price=fill_price)
+        self.positions[strategy][token] = pos
+        return pos
 
     def close(self, strategy, token, price):
         pos = self.positions[strategy].get(token)
         if pos is None:
             return None
+        slug, side = parse_token(token)
         limit = max(price - self.slippage, 0.001)
-        if not self._submit(token, self._SELL, limit, pos.qty):
+        result = self._submit(slug, side, "SELL", limit, pos.qty)
+        if result is None:
             return None
-        return super().close(strategy, token, price)
+        fill_price, filled_qty = result
+        proceeds = filled_qty * fill_price
+        self.cash[strategy] += proceeds
+        closed_cost = min(filled_qty, pos.qty) * pos.entry_price
+        pnl = proceeds - closed_cost
+        self.realized[strategy] += pnl
+        self.closes[strategy] += 1
+        closed_pos = Position(strategy=pos.strategy, market_key=pos.market_key, token=pos.token,
+                              team=pos.team, qty=min(filled_qty, pos.qty),
+                              entry_price=pos.entry_price, opened_at=pos.opened_at)
+        remaining = pos.qty - filled_qty
+        if remaining <= 1e-9:
+            self.positions[strategy].pop(token, None)
+        else:
+            pos.qty = remaining
+        return closed_pos, fill_price, pnl

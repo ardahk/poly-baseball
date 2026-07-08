@@ -7,20 +7,59 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Market:
-    """A Polymarket MLB moneyline market, matched to an MLB game."""
-    condition_id: str
+    """A Polymarket US MLB moneyline market, matched to an MLB game.
+
+    Polymarket US prices a market in terms of its "long"/"short" sides rather
+    than per-team token ids. `long_team` records which team is priced as the
+    long side; `home_token`/`away_token` synthesize opaque position-key
+    strings ("<slug>:LONG" / "<slug>:SHORT") so the rest of the codebase
+    (paper broker, strategy, journal) can keep treating "token" as a plain
+    string identifier without knowing about the long/short convention.
+    """
+    slug: str                # Polymarket US market slug
     question: str
     home_team: str
     away_team: str
-    home_token: str          # CLOB token id for the home-team outcome
-    away_token: str
+    long_team: str            # which team is priced as the long/YES side
+    tick_size: float = 0.01
     game_pk: int | None = None   # MLB Stats API game id
     start_time: float | None = None  # scheduled first pitch, epoch seconds
     active: bool = True
 
     @property
     def key(self) -> str:
-        return self.condition_id
+        return self.slug
+
+    @property
+    def home_is_long(self) -> bool:
+        return self.home_team == self.long_team
+
+    @property
+    def home_token(self) -> str:
+        return f"{self.slug}:{'LONG' if self.home_is_long else 'SHORT'}"
+
+    @property
+    def away_token(self) -> str:
+        return f"{self.slug}:{'SHORT' if self.home_is_long else 'LONG'}"
+
+
+@dataclass
+class MarketQuote:
+    """Best bid/ask normalized to the home-team side for strategy decisions."""
+    market_key: str
+    home_bid: float
+    home_ask: float
+    long_bid: float
+    long_ask: float
+    ts: float = field(default_factory=time.time)
+
+    @property
+    def home_mid(self) -> float:
+        return (self.home_bid + self.home_ask) / 2.0
+
+    @property
+    def home_spread(self) -> float:
+        return self.home_ask - self.home_bid
 
 
 @dataclass

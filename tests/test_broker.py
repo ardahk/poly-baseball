@@ -1,6 +1,6 @@
 import pytest
 
-from polybot.broker import PaperBroker
+from polybot.broker import PaperBroker, parse_token
 from polybot.config import RiskConfig
 from polybot.risk import RiskManager
 
@@ -51,6 +51,20 @@ def test_equity_marks_to_market(broker):
     broker.open("math", "m1", "tok1", "T", 0.50, 10.0)
     assert broker.equity("math", {"tok1": 0.60}) == pytest.approx(102.0)
     assert broker.equity("math", {}) == pytest.approx(100.0)  # falls back to entry
+
+
+def test_settle_uses_exact_price_without_slippage():
+    b = PaperBroker(["math"], 100.0, slippage=0.01)
+    b.open("math", "m1", "tok1", "T", 0.50, 10.0)
+    _, fill, pnl = b.settle("math", "tok1", 0.0)
+    assert fill == 0.0
+    assert pnl == pytest.approx(-10.0)
+
+
+def test_parse_token_validates_shape():
+    assert parse_token("market-slug:LONG") == ("market-slug", "LONG")
+    with pytest.raises(ValueError):
+        parse_token("market-slug:YES")
 
 
 def test_risk_max_positions(broker):

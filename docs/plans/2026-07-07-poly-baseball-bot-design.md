@@ -29,12 +29,12 @@ Alternatives considered:
 ## Architecture
 
 ```
-Gamma API (market discovery)        MLB Stats API (free, live game state)
+Polymarket US sports gateway        MLB Stats API (free, live game state)
         │                                   │
         ▼                                   ▼
   Market registry  ◄── team matching ──►  GameState (inning, outs, bases, score)
         │                                   │
-   CLOB REST (midpoints, books)        winprob.py (fair value model)
+   Market BBO endpoint                winprob.py (fair value model)
         │                                   │
         ▼                                   ▼
   PriceHistory ── volatility.py ──► playfulness filter
@@ -61,24 +61,29 @@ Gamma API (market discovery)        MLB Stats API (free, live game state)
   hysteresis band (must exceed ±band to count a flip) + realized volatility of
   recent price changes. A game is tradeable when flips ≥ N or vol ≥ threshold.
 - **Signal** (`strategy.py`): enter when |price move over lookback| ≥ threshold
-  AND model fair value disagrees with the move by ≥ min edge. Exit on take
-  profit (default 12%), stop loss (10%), time stop, or edge collapse.
+  AND model fair value disagrees with the move by ≥ min edge. Early innings
+  require a larger edge and a more extreme fair value because calibration is
+  weaker there. Exit on take profit (default 12%), stop loss (30%), time stop,
+  or edge collapse.
 - **AI judge** (`ai_judge.py`): Claude (default `claude-opus-4-8`, adaptive
   thinking, low effort, structured JSON output) approves/rejects each math
   signal for the "ai" ledger. Fails closed (reject) on API errors.
 - **Brokers** (`broker.py`): `PaperBroker` (default; fills at mid ± slippage,
-  per-strategy cash/positions) and `LiveBroker` (requires `py-clob-client` +
-  keys; guarded).
-- **Risk** (`risk.py`): max concurrent positions, max stake per market, daily
-  loss kill switch — all per strategy.
+  per-strategy cash/positions) and `LiveBroker` (requires the official
+  `polymarket-us` SDK plus Polymarket US API key id/secret; guarded).
+- **Risk** (`risk.py`): max concurrent positions, max stake per market,
+  adaptive $5/$10 sizing, spread checks, daily loss kill switch, and longer
+  same-market lockout after stop loss — all per strategy.
 - **Journal** (`journal.py`): SQLite. Trades, closed round-trips with % return,
-  equity snapshots. `report.py` prints math-vs-AI comparison.
+  equity snapshots, and every observed BBO tick for future replay. `report.py`
+  prints math-vs-AI comparison.
 
 ## Error handling
 
-All external calls (Gamma, CLOB, MLB, Anthropic) are wrapped; a failed poll
-skips the tick rather than crashing the loop. AI judge failure = signal
-rejected for the AI ledger only. Live orders are never retried blindly.
+All external calls (Polymarket US gateway/exchange APIs, MLB, Anthropic) are
+wrapped; a failed poll skips the tick rather than crashing the loop. AI judge
+failure = signal rejected for the AI ledger only. Live orders are never retried
+blindly.
 
 ## Testing
 

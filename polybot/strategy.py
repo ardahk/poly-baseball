@@ -48,13 +48,19 @@ def check_entry(
 
     if not (cfg.min_price <= price <= cfg.max_price):
         return None
+    edge = fair - price
+    if game_state.inning <= cfg.early_game_max_inning:
+        fair_extreme = fair >= cfg.early_game_min_fair_extreme \
+            or fair <= 1.0 - cfg.early_game_min_fair_extreme
+        if edge < cfg.early_game_min_edge or not fair_extreme:
+            return None
 
     return Signal(
         market=market, token=token, side_team=team,
         price=price, fair=fair, move=move,
         reason=(
             f"fade move {move:+.3f}/{cfg.move_lookback_secs:.0f}s; "
-            f"price {price:.3f} vs fair {fair:.3f} (edge {fair - price:+.3f})"
+            f"price {price:.3f} vs fair {fair:.3f} (edge {edge:+.3f})"
         ),
     )
 

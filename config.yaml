@@ -5,20 +5,28 @@ strategy:
   move_lookback_secs: 90      # window for detecting a sharp move
   move_threshold: 0.08        # min |price change| over the window (8 cents)
   min_edge: 0.05              # model must disagree with the move by >= this
+  early_game_max_inning: 5    # early innings are noisier; trade only strong setups
+  early_game_min_edge: 0.10
+  early_game_min_fair_extreme: 0.70
   min_price: 0.10             # never buy tokens priced below
   max_price: 0.85             # or above
+  max_spread: 0.06            # skip entries if best ask - best bid is wider
+  strong_stake_max_spread: 0.03
   take_profit: 0.12           # +12% -> close (your 5-30% band; tune here)
   stop_loss: 0.30             # -30% -> close (high risk: give reversion room)
   max_hold_secs: 900          # 15 min time stop
   edge_exit: 0.03             # close if model edge flips against us
   cooldown_secs: 120          # per-market cooldown between trades
+  stop_loss_cooldown_secs: 900 # no fast re-entry after getting stopped
   min_flips: 2                # "playful game" filter: 0.5-crossings needed...
   flip_band: 0.03             #   ...beyond this band around 0.5
   min_volatility: 0.015       # OR realized vol >= this
   vol_window: 30
 
 risk:
-  stake_usd: 5                # notional per trade ($5-10; start at 5 to last)
+  stake_usd: 5                # base notional per trade
+  strong_stake_usd: 10        # only for high-edge, tight-spread setups
+  strong_stake_min_edge: 0.12
   max_positions: 3            # concurrent positions per strategy
   max_stake_per_market: 20
   daily_loss_limit_usd: 25    # halt new entries past this realized loss

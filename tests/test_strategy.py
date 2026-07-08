@@ -7,9 +7,9 @@ from polybot.volatility import PriceHistory
 
 
 def make_market():
-    return Market(condition_id="c1", question="A vs. B",
+    return Market(slug="m1", question="A vs. B",
                   home_team="Homers", away_team="Awayers",
-                  home_token="HT", away_token="AT", game_pk=1)
+                  long_team="Homers", game_pk=1)
 
 
 def live_gs(**kw):
@@ -33,7 +33,7 @@ def test_entry_fades_drop_when_model_disagrees():
     gs = live_gs(inning=7, is_top=True, home_score=4, away_score=1)  # fair ~high
     sig = check_entry(make_market(), h, gs, CFG)
     assert sig is not None
-    assert sig.token == "HT"
+    assert sig.token == "m1:LONG"
     assert sig.fair > sig.price
 
 
@@ -51,7 +51,7 @@ def test_entry_buys_away_token_on_spike():
     gs = live_gs(inning=7, is_top=True, home_score=1, away_score=4)
     sig = check_entry(make_market(), h, gs, CFG)
     assert sig is not None
-    assert sig.token == "AT"
+    assert sig.token == "m1:SHORT"
 
 
 def test_no_entry_without_playfulness():
@@ -68,6 +68,26 @@ def test_no_entry_when_game_not_live():
     gs = GameState(game_pk=1, status="Scheduled")
     assert check_entry(make_market(), h, gs, CFG) is None
     assert check_entry(make_market(), h, None, CFG) is None
+
+
+def test_early_game_requires_stronger_edge_and_extreme_fair():
+    h = playful_history([0.60, 0.40, 0.60, 0.60, 0.40])
+    gs = live_gs(inning=3, is_top=True, home_score=1, away_score=0)
+    cfg = StrategyConfig(move_lookback_secs=60, move_threshold=0.08, min_edge=0.05,
+                         early_game_min_edge=0.10, early_game_min_fair_extreme=0.70,
+                         min_flips=2, min_volatility=99.0)
+    assert check_entry(make_market(), h, gs, cfg) is None
+
+
+def test_early_game_allows_strong_extreme_signal():
+    h = playful_history([0.60, 0.40, 0.60, 0.60, 0.40])
+    gs = live_gs(inning=5, is_top=True, home_score=5, away_score=1)
+    cfg = StrategyConfig(move_lookback_secs=60, move_threshold=0.08, min_edge=0.05,
+                         early_game_min_edge=0.10, early_game_min_fair_extreme=0.70,
+                         min_flips=2, min_volatility=99.0)
+    sig = check_entry(make_market(), h, gs, cfg)
+    assert sig is not None
+    assert sig.edge >= cfg.early_game_min_edge
 
 
 def pos(entry=0.50, opened_offset=0.0):

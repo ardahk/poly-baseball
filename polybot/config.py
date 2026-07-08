@@ -19,14 +19,20 @@ class StrategyConfig:
     move_lookback_secs: float = 90.0     # window for "sharp move" detection
     move_threshold: float = 0.08         # min |price change| over lookback
     min_edge: float = 0.05               # min model-vs-market divergence
+    early_game_max_inning: int = 5       # through this inning, require a stronger setup
+    early_game_min_edge: float = 0.10    # early trades need more edge
+    early_game_min_fair_extreme: float = 0.70  # early fair must be >= this or <= 1-this
     min_price: float = 0.10              # don't buy tokens below this
     max_price: float = 0.85              # don't buy tokens above this
+    max_spread: float = 0.06             # skip entries if best ask - best bid is wider
+    strong_stake_max_spread: float = 0.03  # larger stake only when spread is tight
     # Exit (fractions of entry price)
     take_profit: float = 0.12            # +12% -> close
     stop_loss: float = 0.10              # -10% -> close
     max_hold_secs: float = 900.0         # time stop: 15 minutes
     edge_exit: float = 0.03              # close if model edge flips against us
     cooldown_secs: float = 120.0         # per-market cooldown after a trade
+    stop_loss_cooldown_secs: float = 900.0  # longer lockout after getting stopped
     # Playfulness filter
     min_flips: int = 2                   # 0.5-crossings required
     flip_band: float = 0.03              # hysteresis band around 0.5
@@ -36,7 +42,9 @@ class StrategyConfig:
 
 @dataclass
 class RiskConfig:
-    stake_usd: float = 10.0              # notional per trade
+    stake_usd: float = 5.0               # base notional per trade
+    strong_stake_usd: float = 10.0       # high-edge, tight-spread notional
+    strong_stake_min_edge: float = 0.12  # edge needed for strong stake
     max_positions: int = 3               # concurrent positions per strategy
     max_stake_per_market: float = 20.0
     daily_loss_limit_usd: float = 25.0   # kill switch per strategy

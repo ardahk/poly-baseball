@@ -4,12 +4,12 @@ from __future__ import annotations
 import logging
 import time
 
-from . import clob, gamma, mlb, strategy
+from . import mlb, pmus, strategy
 from .ai_judge import AIJudge
 from .broker import LiveBroker, PaperBroker
 from .config import Config
 from .journal import Journal
-from .models import GameState, Market
+from .models import GameState, Market, MarketQuote
 from .risk import RiskManager
 from .volatility import PriceHistory
 from .winprob import home_win_probability
@@ -33,14 +33,15 @@ class Engine:
                                  cfg.engine.slippage)
         self.risk = RiskManager(cfg.risk, self.strategies)
         self.journal = Journal(cfg.engine.db_path)
-        self.feed = clob.PriceFeed()
+        self.feed = pmus.PriceFeed()
         self.mlb = mlb.MLBClient()
 
         self.markets: dict[str, Market] = {}
         self.histories: dict[str, PriceHistory] = {}       # market_key -> home-token history
         self.game_states: dict[int, GameState] = {}
-        self.cooldowns: dict[tuple[str, str], float] = {}  # (strategy, market) -> ts
+        self.cooldowns: dict[tuple[str, str], float] = {}  # (strategy, market) -> reopen ts
         self.latest_prices: dict[str, float] = {}          # token -> price
+        self.latest_quotes: dict[str, MarketQuote] = {}    # market_key -> latest BBO
 
         self._last_discovery = 0.0
         self._last_game_poll = 0.0
@@ -75,7 +76,7 @@ class Engine:
                 and self.markets:
             return
         self._last_discovery = now
-        found = gamma.fetch_mlb_markets()
+        found = pmus.fetch_mlb_markets()
         games = self.mlb.todays_games()
         mlb.match_markets_to_games(found, games)
         for m in found:
@@ -99,12 +100,14 @@ class Engine:
             gs = self.game_states.get(market.game_pk)
             if gs and gs.is_final:
                 continue
-            mid = self.feed.midpoint(market.home_token)
-            if mid is None:
+            quote = self.feed.quote(market)
+            if quote is None:
                 continue
-            self.histories[market.key].add(mid)
-            self.latest_prices[market.home_token] = mid
-            self.latest_prices[market.away_token] = 1.0 - mid
+            self.journal.record_price(market, quote)
+            self.latest_quotes[market.key] = quote
+            self.histories[market.key].add(quote.home_mid)
+            self.latest_prices[market.home_token] = quote.home_mid
+            self.latest_prices[market.away_token] = 1.0 - quote.home_mid
 
     # ----------------------------------------------------------------- exits
 
@@ -136,7 +139,9 @@ class Engine:
                  strat, position.team, fill, pnl_pct * 100, pnl, reason)
         self.journal.record_close(strat, position.market_key, position.team,
                                   position.token, position.qty, fill, pnl, pnl_pct, reason)
-        self.cooldowns[(strat, position.market_key)] = time.time()
+        cooldown = self.cfg.strategy.stop_loss_cooldown_secs \
+            if reason.startswith("stop loss") else self.cfg.strategy.cooldown_secs
+        self.cooldowns[(strat, position.market_key)] = time.time() + cooldown
 
     # --------------------------------------------------------------- entries
 
@@ -144,31 +149,43 @@ class Engine:
         scfg = self.cfg.strategy
         for market in self.markets.values():
             gs = self.game_states.get(market.game_pk)
+            quote = self.latest_quotes.get(market.key)
+            if quote is None or quote.home_spread > scfg.max_spread:
+                continue
             sig = strategy.check_entry(market, self.histories[market.key], gs, scfg)
             if sig is None:
                 continue
             for strat in self.strategies:
-                if time.time() - self.cooldowns.get((strat, market.key), 0) < scfg.cooldown_secs:
+                if time.time() < self.cooldowns.get((strat, market.key), 0):
                     continue
                 if sig.token in self.broker.positions[strat]:
                     continue
-                if not self.risk.can_open(self.broker, strat, market.key):
+                stake = self._stake_for_signal(sig, quote)
+                if not self.risk.can_open(self.broker, strat, market.key, stake):
                     continue
-                reason = sig.reason
+                reason = f"{sig.reason}; spread {quote.home_spread:.3f}; stake ${stake:.0f}"
                 if strat == AI:
                     verdict = self.judge.judge(sig, gs)
                     if not verdict.approve:
                         log.info("[ai] rejected %s: %s", sig.side_team, verdict.reason)
-                        self.cooldowns[(AI, market.key)] = time.time()
+                        self.cooldowns[(AI, market.key)] = time.time() + scfg.cooldown_secs
                         continue
                     reason += f" | ai: {verdict.reason} ({verdict.confidence:.2f})"
                 pos = self.broker.open(strat, market.key, sig.token, sig.side_team,
-                                       sig.price, self.cfg.risk.stake_usd)
+                                       sig.price, stake)
                 if pos:
                     log.info("[%s] OPEN %s @ %.3f — %s",
                              strat, sig.side_team, pos.entry_price, reason)
                     self.journal.record_open(strat, market.key, sig.side_team,
                                              sig.token, pos.qty, pos.entry_price, reason)
+
+    def _stake_for_signal(self, sig, quote: MarketQuote) -> float:
+        rcfg = self.cfg.risk
+        scfg = self.cfg.strategy
+        if sig.edge >= rcfg.strong_stake_min_edge \
+                and quote.home_spread <= scfg.strong_stake_max_spread:
+            return rcfg.strong_stake_usd
+        return rcfg.stake_usd
 
     # ---------------------------------------------------------------- equity
 

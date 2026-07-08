@@ -3,7 +3,7 @@
 
 Usage:
   python main.py run             # paper trade (default)
-  python main.py run --live      # real orders (needs py-clob-client + keys)
+  python main.py run --live      # real orders (needs polymarket-us + keys)
   python main.py scan            # one-shot: show tradeable markets right now
   python main.py report          # math-vs-AI performance comparison
   python main.py backtest calibrate --days 3   # is the win-prob formula accurate?
@@ -15,8 +15,7 @@ import argparse
 import logging
 import sys
 
-from polybot import backtest, gamma, mlb
-from polybot.clob import PriceFeed
+from polybot import backtest, mlb, pmus
 from polybot.config import load_config
 from polybot.engine import Engine
 from polybot.report import print_report
@@ -34,16 +33,16 @@ def cmd_run(args, cfg):
 
 
 def cmd_scan(args, cfg):
-    markets = gamma.fetch_mlb_markets()
+    markets = pmus.fetch_mlb_markets()
     client = mlb.MLBClient()
     games = client.todays_games()
     mlb.match_markets_to_games(markets, games)
-    feed = PriceFeed()
+    feed = pmus.PriceFeed()
     matched = [m for m in markets if m.game_pk]
     print(f"{len(markets)} MLB markets found, {len(matched)} matched to today's games\n")
     for m in matched:
         gs = client.game_state(m.game_pk)
-        mid = feed.midpoint(m.home_token)
+        mid = feed.home_midpoint(m)
         line = f"  {m.question:<50}"
         if mid is not None:
             line += f" home={mid:.3f}"

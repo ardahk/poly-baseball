@@ -8,14 +8,19 @@ Two modes, both using *real* finished MLB games:
    loss, calibration table). Needs only the MLB Stats API. This is the direct
    answer to "is the formula decent" — no Polymarket data involved.
 
-2. strategy — would the TRADING logic have made money? Replays real Polymarket
-   price history for finished games against the reconstructed game-state
-   timeline, through the exact same check_entry/check_exit code the live bot
-   uses, on a paper broker. Needs Gamma + CLOB price history + MLB.
+2. strategy — would the TRADING logic have made money? Attempts to replay
+   Polymarket US 1-minute trade-stat candles for finished games against the
+   reconstructed game-state timeline, through the exact same check_entry /
+   check_exit code the live bot uses, on a paper broker. Needs Polymarket US +
+   MLB.
 
-Limitation: CLOB price history is ~1-minute resolution, so intraminute moves the
-live bot (2s polling) would catch are invisible here. Treat strategy P&L as a
-conservative, directional estimate, not a precise forecast.
+Limitation: Polymarket US historical candles are documented in more than one
+shape and may require exchange data access. This mode attempts the documented
+trade-stats endpoints and fails gracefully (with a clear message) if they are
+not available; `calibrate` (below) needs no exchange data and is the reliable
+way to validate the formula. Even when candles work, ~1-minute resolution
+understates the live bot's edge (2s polling) — treat strategy P&L as
+directional, not precise.
 """
 from __future__ import annotations
 
@@ -25,9 +30,7 @@ import statistics
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-import requests
-
-from . import gamma, mlb, strategy
+from . import mlb, pmus, strategy
 from .broker import PaperBroker
 from .config import Config
 from .models import GameState, Market
@@ -35,8 +38,6 @@ from .volatility import PriceHistory
 from .winprob import home_win_probability
 
 log = logging.getLogger(__name__)
-
-CLOB_HISTORY = "https://clob.polymarket.com/prices-history"
 
 
 # ----------------------------------------------------------------- timelines
@@ -197,18 +198,6 @@ def calibrate(days_back: int = 3, max_games: int = 60) -> None:
 
 # ----------------------------------------------------------- strategy replay
 
-def _fetch_price_history(session: requests.Session, token: str) -> list[tuple[float, float]]:
-    try:
-        resp = session.get(CLOB_HISTORY,
-                           params={"market": token, "interval": "max", "fidelity": 1},
-                           timeout=20)
-        resp.raise_for_status()
-        return [(float(pt["t"]), float(pt["p"])) for pt in resp.json().get("history", [])]
-    except Exception as exc:
-        log.debug("price history failed for %s: %s", token, exc)
-        return []
-
-
 def _state_at(timeline: list[tuple[float, GameState]], ts: float) -> GameState | None:
     """Most recent game state at or before ts (linear scan; timelines are small)."""
     current = None
@@ -221,12 +210,13 @@ def _state_at(timeline: list[tuple[float, GameState]], ts: float) -> GameState |
 
 
 def _replay_game(cfg: Config, market: Market, prices: list[tuple[float, float]],
-                 timeline: list[tuple[float, GameState]], broker: PaperBroker) -> None:
+                 timeline: list[tuple[float, GameState]], home_won: bool | None,
+                 broker: PaperBroker) -> None:
     """Run one game's price+state stream through the live strategy logic."""
     scfg = cfg.strategy
     history = PriceHistory(scfg.flip_band)
     key = market.key
-    last_trade_ts = -1e18
+    cooldown_until = -1e18
     if not timeline:
         return
     first_state_ts = timeline[0][0]
@@ -251,74 +241,97 @@ def _replay_game(cfg: Config, market: Market, prices: list[tuple[float, float]],
             reason = strategy.check_exit(pos, price, fair, game_final, scfg, now=ts)
             if reason:
                 broker.close("backtest", pos.token, price)
-                last_trade_ts = ts
+                cooldown = scfg.stop_loss_cooldown_secs \
+                    if reason.startswith("stop loss") else scfg.cooldown_secs
+                cooldown_until = ts + cooldown
 
         if game_final:
             break
 
         # --- entries ---
-        if ts - last_trade_ts < scfg.cooldown_secs:
+        if ts < cooldown_until:
             continue
         sig = strategy.check_entry(market, history, gs, scfg)
         if sig is None or sig.token in broker.positions["backtest"]:
             continue
+        stake = cfg.risk.stake_usd
         if len(broker.open_positions("backtest")) >= cfg.risk.max_positions:
             continue
+        if broker.stake_in_market("backtest", key) + stake > cfg.risk.max_stake_per_market:
+            continue
         pos = broker.open("backtest", key, sig.token, sig.side_team,
-                          sig.price, cfg.risk.stake_usd)
+                          sig.price, stake)
         if pos:
             pos.opened_at = ts       # simulated clock, not wall-clock
-            last_trade_ts = ts
+            cooldown_until = ts + scfg.cooldown_secs
 
     # Force-close anything still open at the final whistle at the settled price.
     for pos in list(broker.open_positions("backtest")):
         if pos.market_key != key:
             continue
-        home_won = timeline and home_win_probability(timeline[-1][1])
-        settle = prices[-1][1] if prices else pos.entry_price
-        price = settle if pos.token == market.home_token else 1.0 - settle
-        broker.close("backtest", pos.token, price)
+        if home_won is None:
+            settle = prices[-1][1] if prices else pos.entry_price
+            price = settle if pos.token == market.home_token else 1.0 - settle
+        else:
+            token_won = (
+                (pos.token == market.home_token and home_won)
+                or (pos.token == market.away_token and not home_won)
+            )
+            price = 1.0 if token_won else 0.0
+        broker.settle("backtest", pos.token, price)
 
 
 def strategy_backtest(cfg: Config, days_back: int = 2, max_games: int = 30) -> None:
     client = mlb.MLBClient()
-    session = requests.Session()
     end = date.today()
     start = end - timedelta(days=days_back)
     finished = [g for g in client.schedule(start.isoformat(), end.isoformat())
                 if g["status"] == "Final"]
 
-    # Gamma only exposes the team-outcome moneyline market while the event is
-    # still open (recently-final games included); it restructures the event
-    # once the game fully settles. So the open feed is what has usable tokens.
-    markets = gamma.fetch_mlb_markets(session, include_closed=False, limit=400)
+    markets = pmus.fetch_mlb_markets(include_closed=True, limit=400)
     mlb.match_markets_to_games(markets, finished)
     tradeable = [m for m in markets if m.game_pk][:max_games]
-    print(f"Replaying strategy on {len(tradeable)} finished games with live "
-          f"markets (mostly today's slate)...\n")
+    print(f"Replaying strategy on {len(tradeable)} finished games with "
+          f"Polymarket US moneyline markets...\n")
     if not tradeable:
-        print("No finished games currently have an open moneyline market to "
-              "replay. Run this shortly after games end, or rely on `calibrate`\n"
-              "(which validates the formula across many days) plus paper-mode\n"
-              "trading to accumulate real strategy results in the journal.")
+        print("No finished games currently have a discoverable Polymarket US "
+              "moneyline market. Use `backtest calibrate` to validate the\n"
+              "formula, and run paper mode during live games to accumulate\n"
+              "real strategy results in the journal.")
         return
 
     broker = PaperBroker(["backtest"], cfg.risk.starting_cash, cfg.engine.slippage)
     games_with_trades = 0
+    games_with_candles = 0
     for market in tradeable:
-        prices = _fetch_price_history(session, market.home_token)
-        if len(prices) < 5:
-            continue
-        timeline, _ = build_state_timeline(client, market.game_pk)
+        timeline, home_won = build_state_timeline(client, market.game_pk)
         if not timeline:
             continue
+        start_ts = timeline[0][0] - 3600
+        end_ts = timeline[-1][0] + 3600
+        bars = max(1, min(1440, int((end_ts - start_ts) // 60) + 1))
+        long_prices = pmus.fetch_long_price_history(market.slug, start_ts, end_ts, bars=bars)
+        if len(long_prices) < 5:
+            continue
+        games_with_candles += 1
+        prices = [
+            (ts, price if market.home_is_long else 1.0 - price)
+            for ts, price in long_prices
+        ]
         before = broker.realized["backtest"]
         n_before = broker.closes["backtest"]
-        _replay_game(cfg, market, prices, timeline, broker)
+        _replay_game(cfg, market, prices, timeline, home_won, broker)
         if broker.closes["backtest"] > n_before:
             games_with_trades += 1
             pnl = broker.realized["backtest"] - before
             print(f"  {market.question:<46} trades P&L ${pnl:+.2f}")
+
+    if not games_with_candles:
+        print("No usable Polymarket US historical candles were returned for "
+              "the matched games. That can be an access/API-history limitation,\n"
+              "not necessarily a strategy result. `backtest calibrate` still "
+              "validates the win-probability formula without exchange data.")
+        return
 
     realized = broker.realized["backtest"]
     equity = broker.equity("backtest", {})
@@ -326,6 +339,7 @@ def strategy_backtest(cfg: Config, days_back: int = 2, max_games: int = 30) -> N
     print("\n" + "=" * 60)
     print("STRATEGY BACKTEST RESULTS")
     print("=" * 60)
+    print(f"games with candles: {games_with_candles}")
     print(f"games with trades : {games_with_trades}")
     print(f"round-trip trades : {trades}")
     print(f"realized P&L      : ${realized:+.2f}")

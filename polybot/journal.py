@@ -26,6 +26,20 @@ CREATE TABLE IF NOT EXISTS equity (
     cash REAL NOT NULL,
     open_positions INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS price_ticks (
+    ts REAL NOT NULL,
+    market TEXT NOT NULL,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    home_bid REAL NOT NULL,
+    home_ask REAL NOT NULL,
+    home_mid REAL NOT NULL,
+    home_spread REAL NOT NULL,
+    long_bid REAL NOT NULL,
+    long_ask REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_price_ticks_market_ts
+    ON price_ticks (market, ts);
 """
 
 
@@ -57,6 +71,18 @@ class Journal:
         self.conn.execute(
             "INSERT INTO equity (ts, strategy, equity, cash, open_positions) VALUES (?,?,?,?,?)",
             (time.time(), strategy, equity, cash, open_positions),
+        )
+        self.conn.commit()
+
+    def record_price(self, market, quote):
+        self.conn.execute(
+            "INSERT INTO price_ticks (ts, market, home_team, away_team, home_bid, home_ask,"
+            " home_mid, home_spread, long_bid, long_ask) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                quote.ts, market.key, market.home_team, market.away_team,
+                quote.home_bid, quote.home_ask, quote.home_mid, quote.home_spread,
+                quote.long_bid, quote.long_ask,
+            ),
         )
         self.conn.commit()
 
