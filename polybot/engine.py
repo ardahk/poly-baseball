@@ -90,15 +90,31 @@ class Engine:
         if now - self._last_game_poll < self.cfg.engine.game_state_interval_secs:
             return
         self._last_game_poll = now
-        for pk in {m.game_pk for m in self.markets.values() if m.game_pk}:
-            gs = self.mlb.game_state(pk)
+        seen: set[int] = set()
+        for market in self.markets.values():
+            if not market.game_pk or market.game_pk in seen:
+                continue
+            seen.add(market.game_pk)
+            if not self._should_poll_game_state(market, now):
+                continue
+            gs = self.mlb.game_state(market.game_pk)
             if gs:
-                self.game_states[pk] = gs
+                self.game_states[market.game_pk] = gs
+
+    def _should_poll_game_state(self, market: Market, now: float) -> bool:
+        current = self.game_states.get(market.game_pk)
+        if current and current.is_final:
+            return False
+        if current and current.is_live:
+            return True
+        if market.start_time is None:
+            return True
+        return now >= market.start_time - self.cfg.engine.pregame_game_state_window_secs
 
     def _poll_prices(self):
         for market in self.markets.values():
             gs = self.game_states.get(market.game_pk)
-            if gs and gs.is_final:
+            if not gs or not gs.is_live:
                 continue
             quote = self.feed.quote(market)
             if quote is None:

@@ -4,6 +4,7 @@
 Usage:
   python main.py run             # paper trade (default)
   python main.py run --live      # real orders (needs polymarket-us + keys)
+  python main.py run --live --yes-live  # real orders without prompt (systemd)
   python main.py scan            # one-shot: show tradeable markets right now
   python main.py report          # math-vs-AI performance comparison
   python main.py backtest calibrate --days 3   # is the win-prob formula accurate?
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from polybot import backtest, mlb, pmus
@@ -25,8 +27,11 @@ from polybot.winprob import home_win_probability
 def cmd_run(args, cfg):
     if args.live:
         cfg.engine.live = True
-        confirm = input("LIVE trading with real funds. Type 'yes' to continue: ")
-        if confirm.strip().lower() != "yes":
+        confirmed = args.yes_live or os.environ.get("POLYBOT_CONFIRM_LIVE", "").lower() == "yes"
+        if not confirmed:
+            confirm = input("LIVE trading with real funds. Type 'yes' to continue: ")
+            confirmed = confirm.strip().lower() == "yes"
+        if not confirmed:
             print("aborted")
             return
     Engine(cfg).run()
@@ -75,6 +80,11 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     p_run = sub.add_parser("run", help="start the trading loop")
     p_run.add_argument("--live", action="store_true", help="submit real orders")
+    p_run.add_argument(
+        "--yes-live",
+        action="store_true",
+        help="skip the live-trading confirmation prompt; use only for unattended services",
+    )
     sub.add_parser("scan", help="show current MLB markets and model fair values")
     sub.add_parser("report", help="print math-vs-AI performance report")
     p_bt = sub.add_parser("backtest", help="validate the models on finished games")

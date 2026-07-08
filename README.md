@@ -35,6 +35,7 @@ python main.py scan          # what MLB markets exist right now + model fair val
 python main.py run           # paper trade (default, no keys needed)
 python main.py report        # math-vs-AI performance comparison
 python main.py run --live    # real orders — requires pip install polymarket-us + keys
+python main.py run --live --yes-live  # real orders without prompt for systemd
 
 python main.py backtest calibrate --days 7   # is the win-prob formula accurate?
 python main.py backtest strategy  --days 1   # would the trading logic have profited?
@@ -44,6 +45,10 @@ Run it during live MLB games (evenings US time); outside game hours there is
 nothing to trade. Trades, equity snapshots, and every observed best-bid /
 best-ask price tick are logged to `polybot.db` (SQLite); `report` prints win
 rate, average % per trade, best/worst, and account return per strategy.
+
+For unattended live mode, either use `--yes-live` in the service command or set
+`POLYBOT_CONFIRM_LIVE=yes` in `.env`. Manual `--live` runs still prompt by
+default.
 
 ## Tuning
 
@@ -76,7 +81,9 @@ Two ways to validate the math on **real finished games** before risking money:
   matched to MLB Stats API games by team name and scheduled start time.
 - **Prices**: Polymarket US market BBO midpoints polled every ~2s per market.
   Every BBO tick is recorded so future backtests can replay the bot's own
-  observed market history.
+  observed market history. To avoid noisy API usage, BBO polling only starts
+  once MLB reports a game as live; game-state checks begin shortly before first
+  pitch.
 - **Fair value**: normal model of the final run differential using a
   run-expectancy (RE24) adjustment for the current base/out state.
 - **Playfulness**: only trades games whose price has crossed 50% repeatedly
