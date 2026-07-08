@@ -8,7 +8,7 @@ strategy:
   min_price: 0.10             # never buy tokens priced below
   max_price: 0.85             # or above
   take_profit: 0.12           # +12% -> close (your 5-30% band; tune here)
-  stop_loss: 0.10             # -10% -> close
+  stop_loss: 0.30             # -30% -> close (high risk: give reversion room)
   max_hold_secs: 900          # 15 min time stop
   edge_exit: 0.03             # close if model edge flips against us
   cooldown_secs: 120          # per-market cooldown between trades
@@ -18,7 +18,7 @@ strategy:
   vol_window: 30
 
 risk:
-  stake_usd: 10               # notional per trade
+  stake_usd: 5                # notional per trade ($5-10; start at 5 to last)
   max_positions: 3            # concurrent positions per strategy
   max_stake_per_market: 20
   daily_loss_limit_usd: 25    # halt new entries past this realized loss

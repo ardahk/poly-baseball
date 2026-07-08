@@ -24,19 +24,26 @@ def _parse_json_field(value):
     return value or []
 
 
-def fetch_mlb_markets(session: requests.Session | None = None) -> list[Market]:
-    """Fetch open MLB game (moneyline) markets.
+def fetch_mlb_markets(
+    session: requests.Session | None = None,
+    include_closed: bool = False,
+    limit: int = 200,
+) -> list[Market]:
+    """Fetch MLB game (moneyline) markets.
 
     Each event should hold one binary market whose two outcomes are the teams.
+    `include_closed=True` also returns settled markets (for backtesting).
     """
     sess = session or requests.Session()
     markets: list[Market] = []
+    params = {"tag_slug": "mlb", "limit": limit}
+    if include_closed:
+        # Settled game markets — newest first so recent finished games surface.
+        params.update({"closed": "true", "order": "startDate", "ascending": "false"})
+    else:
+        params["closed"] = "false"
     try:
-        resp = sess.get(
-            f"{GAMMA_URL}/events",
-            params={"tag_slug": "mlb", "closed": "false", "limit": 200},
-            timeout=15,
-        )
+        resp = sess.get(f"{GAMMA_URL}/events", params=params, timeout=15)
         resp.raise_for_status()
         events = resp.json()
     except Exception as exc:
@@ -45,30 +52,31 @@ def fetch_mlb_markets(session: requests.Session | None = None) -> list[Market]:
 
     for event in events:
         for m in event.get("markets", []):
-            market = _parse_market(m, event)
+            market = _parse_market(m, event, include_closed)
             if market:
                 markets.append(market)
     log.info("Gamma: %d MLB markets discovered", len(markets))
     return markets
 
 
-def _parse_market(m: dict, event: dict) -> Market | None:
+def _parse_market(m: dict, event: dict, include_closed: bool = False) -> Market | None:
     outcomes = _parse_json_field(m.get("outcomes"))
     token_ids = _parse_json_field(m.get("clobTokenIds"))
     if len(outcomes) != 2 or len(token_ids) != 2:
         return None
-    if m.get("closed") or not m.get("active", True):
+    if not include_closed and (m.get("closed") or not m.get("active", True)):
         return None
-    # Skip prop markets (over/under, "will X hit a home run", etc.):
-    # a moneyline market's outcomes are team names, not Yes/No.
-    if {o.strip().lower() for o in outcomes} == {"yes", "no"}:
+    # A moneyline market's two outcomes are team names. Everything else on the
+    # MLB tag (props, over/unders, spreads) has generic outcomes or telltale
+    # question text — reject those.
+    outcome_set = {o.strip().lower() for o in outcomes}
+    if outcome_set & {"yes", "no", "over", "under"}:
         return None
 
     question = m.get("question") or event.get("title") or ""
-    # Spread/total markets share team-name outcomes with the moneyline;
-    # only the plain "Away vs. Home" moneyline is tradeable by our model.
     ql = question.lower()
-    if any(word in ql for word in ("spread", "total", "run line", "(-", "(+")):
+    if any(word in ql for word in
+           ("spread", "total", "run line", "o/u", ":", "(-", "(+")):
         return None
     # Convention: "Away vs. Home" / "Away @ Home"; outcomes usually
     # [away, home] but we match by name below, so order only matters as

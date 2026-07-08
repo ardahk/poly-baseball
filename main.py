@@ -6,6 +6,8 @@ Usage:
   python main.py run --live      # real orders (needs py-clob-client + keys)
   python main.py scan            # one-shot: show tradeable markets right now
   python main.py report          # math-vs-AI performance comparison
+  python main.py backtest calibrate --days 3   # is the win-prob formula accurate?
+  python main.py backtest strategy  --days 2   # would the trading logic profit?
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ import argparse
 import logging
 import sys
 
-from polybot import gamma, mlb
+from polybot import backtest, gamma, mlb
 from polybot.clob import PriceFeed
 from polybot.config import load_config
 from polybot.engine import Engine
@@ -60,6 +62,13 @@ def cmd_report(args, cfg):
     print_report(cfg.engine.db_path, cfg.risk.starting_cash)
 
 
+def cmd_backtest(args, cfg):
+    if args.mode == "calibrate":
+        backtest.calibrate(days_back=args.days, max_games=args.max_games)
+    else:
+        backtest.strategy_backtest(cfg, days_back=args.days, max_games=args.max_games)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="polybot")
     parser.add_argument("--config", default="config.yaml")
@@ -69,6 +78,10 @@ def main():
     p_run.add_argument("--live", action="store_true", help="submit real orders")
     sub.add_parser("scan", help="show current MLB markets and model fair values")
     sub.add_parser("report", help="print math-vs-AI performance report")
+    p_bt = sub.add_parser("backtest", help="validate the models on finished games")
+    p_bt.add_argument("mode", choices=["calibrate", "strategy"])
+    p_bt.add_argument("--days", type=int, default=3, help="days back to include")
+    p_bt.add_argument("--max-games", type=int, default=40)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -79,7 +92,8 @@ def main():
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     cfg = load_config(args.config)
-    {"run": cmd_run, "scan": cmd_scan, "report": cmd_report}[args.command](args, cfg)
+    {"run": cmd_run, "scan": cmd_scan, "report": cmd_report,
+     "backtest": cmd_backtest}[args.command](args, cfg)
 
 
 if __name__ == "__main__":

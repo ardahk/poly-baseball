@@ -35,6 +35,9 @@ python main.py scan          # what MLB markets exist right now + model fair val
 python main.py run           # paper trade (default, no keys needed)
 python main.py report        # math-vs-AI performance comparison
 python main.py run --live    # real orders — requires pip install py-clob-client + keys
+
+python main.py backtest calibrate --days 7   # is the win-prob formula accurate?
+python main.py backtest strategy  --days 1   # would the trading logic have profited?
 ```
 
 Run it during live MLB games (evenings US time); outside game hours there is
@@ -47,6 +50,25 @@ strategy.
 All knobs are in `config.yaml` with comments — entry thresholds, the 5–30%
 take-profit band, playfulness definition, stake sizing, and risk limits
 (max concurrent positions, per-market cap, daily-loss kill switch).
+
+## Backtesting
+
+Two ways to validate the math on **real finished games** before risking money:
+
+- **`backtest calibrate`** — the direct test of the formula. Walks play-by-play
+  for finished games, computes the model's P(home win) at every game state, and
+  scores it against who actually won. Reports Brier score and log loss vs two
+  baselines (bet-the-leader, and a constant), plus a calibration table
+  (predicted probability vs actual home-win rate per bucket). Needs only the
+  free MLB API, so it works over many days. If the formula's Brier beats the
+  baselines and the calibration buckets line up, the formula is decent.
+- **`backtest strategy`** — replays real Polymarket 1-minute price history for
+  finished games through the exact `check_entry`/`check_exit` code the live bot
+  runs, on a paper broker, and reports simulated P&L. Limited to recently-final
+  games (Polymarket stops exposing the team-outcome market once a game fully
+  settles), and 1-min prices understate the 2-second live edge — treat it as a
+  directional sanity check on your thresholds, not a promise. Your real
+  strategy track record accumulates in `report` as you paper-trade.
 
 ## How it works
 

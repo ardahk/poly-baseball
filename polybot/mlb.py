@@ -18,14 +18,12 @@ class MLBClient:
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
 
-    def todays_games(self) -> list[dict]:
-        """[{game_pk, home, away, status}] for today's schedule."""
+    def schedule(self, start_date: str, end_date: str | None = None) -> list[dict]:
+        """[{game_pk, home, away, status, game_date}] over a date range (ISO dates)."""
+        params = {"sportId": 1, "startDate": start_date,
+                  "endDate": end_date or start_date}
         try:
-            resp = self.session.get(
-                f"{MLB_URL}/schedule",
-                params={"sportId": 1, "date": date.today().isoformat()},
-                timeout=15,
-            )
+            resp = self.session.get(f"{MLB_URL}/schedule", params=params, timeout=15)
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
@@ -42,6 +40,10 @@ class MLBClient:
                     "game_date": _parse_game_date(g.get("gameDate")),
                 })
         return games
+
+    def todays_games(self) -> list[dict]:
+        """[{game_pk, home, away, status, game_date}] for today's schedule."""
+        return self.schedule(date.today().isoformat())
 
     def game_state(self, game_pk: int) -> GameState | None:
         try:

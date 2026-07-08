@@ -21,6 +21,7 @@ class PaperBroker:
         self.cash: dict[str, float] = {s: starting_cash for s in strategies}
         self.positions: dict[str, dict[str, Position]] = {s: {} for s in strategies}
         self.realized: dict[str, float] = {s: 0.0 for s in strategies}
+        self.closes: dict[str, int] = {s: 0 for s in strategies}
 
     def open(self, strategy: str, market_key: str, token: str, team: str,
              price: float, stake_usd: float) -> Position | None:
@@ -48,6 +49,7 @@ class PaperBroker:
         self.cash[strategy] += proceeds
         pnl = proceeds - pos.cost
         self.realized[strategy] += pnl
+        self.closes[strategy] += 1
         return pos, fill, pnl
 
     def equity(self, strategy: str, prices: dict[str, float]) -> float:
