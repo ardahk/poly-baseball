@@ -33,6 +33,7 @@ Keys (all optional to start):
 ```bash
 python main.py scan          # what MLB markets exist right now + model fair values
 python main.py run           # paper trade (default, no keys needed)
+python main.py run --dashboard # paper trade with a live terminal dashboard
 python main.py report        # math-vs-AI performance comparison
 python main.py run --live    # real orders — requires pip install polymarket-us + keys
 python main.py run --live --yes-live  # real orders without prompt for systemd
@@ -45,6 +46,9 @@ Run it during live MLB games (evenings US time); outside game hours there is
 nothing to trade. Trades, equity snapshots, and every observed best-bid /
 best-ask price tick are logged to `polybot.db` (SQLite); `report` prints win
 rate, average % per trade, best/worst, and account return per strategy.
+Use `run --dashboard` during a game for a live terminal view of tracked games,
+fresh BBO counts, strategy equity, market state, open positions, and recent
+engine events.
 
 For unattended live mode, either use `--yes-live` in the service command or set
 `POLYBOT_CONFIRM_LIVE=yes` in `.env`. Manual `--live` runs still prompt by

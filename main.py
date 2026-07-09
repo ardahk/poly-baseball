@@ -3,9 +3,11 @@
 
 Usage:
   python main.py run             # paper trade (default)
+  python main.py run --dashboard # paper trade with live terminal dashboard
   python main.py run --live      # real orders (needs polymarket-us + keys)
   python main.py run --live --yes-live  # real orders without prompt (systemd)
   python main.py scan            # one-shot: show tradeable markets right now
+  python main.py status          # show database activity: ticks/trades/equity
   python main.py report          # math-vs-AI performance comparison
   python main.py backtest calibrate --days 3   # is the win-prob formula accurate?
   python main.py backtest strategy  --days 2   # would the trading logic profit?
@@ -16,10 +18,12 @@ import argparse
 import logging
 import os
 import sys
+from datetime import datetime
 
 from polybot import backtest, mlb, pmus
 from polybot.config import load_config
 from polybot.engine import Engine
+from polybot.journal import Journal
 from polybot.report import print_report
 from polybot.winprob import home_win_probability
 
@@ -34,7 +38,7 @@ def cmd_run(args, cfg):
         if not confirmed:
             print("aborted")
             return
-    Engine(cfg).run()
+    Engine(cfg, dashboard=args.dashboard).run()
 
 
 def cmd_scan(args, cfg):
@@ -66,6 +70,38 @@ def cmd_report(args, cfg):
     print_report(cfg.engine.db_path, cfg.risk.starting_cash)
 
 
+def _fmt_ts(ts):
+    if ts is None:
+        return "never"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def cmd_status(args, cfg):
+    journal = Journal(cfg.engine.db_path)
+    try:
+        status = journal.db_status()
+        print("POLYBOT STATUS")
+        print("=" * 60)
+        print(f"db path          : {cfg.engine.db_path}")
+        print(f"price ticks      : {status['price_ticks']}")
+        print(f"latest price tick: {_fmt_ts(status['latest_price_ts'])}")
+        print(f"equity snapshots : {status['equity_snapshots']}")
+        print(f"latest equity    : {_fmt_ts(status['latest_equity_ts'])}")
+        print(f"trade opens      : {status['trades'].get('OPEN', 0)}")
+        print(f"trade closes     : {status['trades'].get('CLOSE', 0)}")
+        print("\nRecent priced markets:")
+        rows = journal.recent_price_markets()
+        if not rows:
+            print("  none yet")
+        for market, home, away, ticks, latest_ts, avg_mid, avg_spread in rows:
+            print(
+                f"  {home} vs {away:<28} ticks={ticks:<5} "
+                f"last={_fmt_ts(latest_ts)} mid~{avg_mid:.3f} spread~{avg_spread:.3f}"
+            )
+    finally:
+        journal.close()
+
+
 def cmd_backtest(args, cfg):
     if args.mode == "calibrate":
         backtest.calibrate(days_back=args.days, max_games=args.max_games)
@@ -81,11 +117,17 @@ def main():
     p_run = sub.add_parser("run", help="start the trading loop")
     p_run.add_argument("--live", action="store_true", help="submit real orders")
     p_run.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="show a live terminal dashboard instead of relying on heartbeat logs",
+    )
+    p_run.add_argument(
         "--yes-live",
         action="store_true",
         help="skip the live-trading confirmation prompt; use only for unattended services",
     )
     sub.add_parser("scan", help="show current MLB markets and model fair values")
+    sub.add_parser("status", help="show database activity and recent price ticks")
     sub.add_parser("report", help="print math-vs-AI performance report")
     p_bt = sub.add_parser("backtest", help="validate the models on finished games")
     p_bt.add_argument("mode", choices=["calibrate", "strategy"])
@@ -93,15 +135,16 @@ def main():
     p_bt.add_argument("--max-games", type=int, default=40)
     args = parser.parse_args()
 
+    dashboard_mode = args.command == "run" and getattr(args, "dashboard", False)
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if args.verbose else logging.WARNING if dashboard_mode else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     cfg = load_config(args.config)
-    {"run": cmd_run, "scan": cmd_scan, "report": cmd_report,
+    {"run": cmd_run, "scan": cmd_scan, "status": cmd_status, "report": cmd_report,
      "backtest": cmd_backtest}[args.command](args, cfg)
 
 

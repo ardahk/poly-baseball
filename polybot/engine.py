@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 
 from . import mlb, pmus, strategy
 from .ai_judge import AIJudge
 from .broker import LiveBroker, PaperBroker
 from .config import Config
+from .dashboard import TerminalDashboard
 from .journal import Journal
 from .models import GameState, Market, MarketQuote
 from .risk import RiskManager
@@ -21,7 +23,7 @@ AI = "ai"
 
 
 class Engine:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, dashboard: bool = False):
         self.cfg = cfg
         self.judge = AIJudge(cfg.ai)
         self.strategies = [MATH] + ([AI] if self.judge.available else [])
@@ -46,12 +48,17 @@ class Engine:
         self._last_discovery = 0.0
         self._last_game_poll = 0.0
         self._last_equity = 0.0
+        self._last_status_log = 0.0
+        self.started_at = time.time()
+        self.dashboard = TerminalDashboard(enabled=dashboard)
+        self.events: deque[str] = deque(maxlen=10)
 
     # ------------------------------------------------------------------ loop
 
     def run(self):
         mode = "LIVE" if self.cfg.engine.live else "PAPER"
-        log.info("engine starting (%s mode, strategies: %s)", mode, self.strategies)
+        self._event("engine starting (%s mode, strategies: %s)", mode, self.strategies)
+        self.dashboard.start()
         try:
             while True:
                 tick_start = time.time()
@@ -61,11 +68,14 @@ class Engine:
                 self._manage_exits()
                 self._look_for_entries()
                 self._maybe_snapshot_equity()
+                self._maybe_log_status()
+                self.dashboard.render(self)
                 elapsed = time.time() - tick_start
                 time.sleep(max(0.0, self.cfg.engine.poll_interval_secs - elapsed))
         except KeyboardInterrupt:
-            log.info("shutting down")
+            self._event("shutting down")
         finally:
+            self.dashboard.close()
             self.journal.close()
 
     # ------------------------------------------------------------- discovery
@@ -83,7 +93,7 @@ class Engine:
             if m.game_pk and m.key not in self.markets:
                 self.markets[m.key] = m
                 self.histories[m.key] = PriceHistory(self.cfg.strategy.flip_band)
-                log.info("tracking: %s (game %s)", m.question, m.game_pk)
+                self._event("tracking: %s (game %s)", m.question, m.game_pk)
 
     def _maybe_poll_games(self):
         now = time.time()
@@ -151,8 +161,8 @@ class Engine:
             return
         position, fill, pnl = result
         pnl_pct = position.pnl_pct(fill)
-        log.info("[%s] CLOSE %s @ %.3f (%+.1f%%, $%+.2f) — %s",
-                 strat, position.team, fill, pnl_pct * 100, pnl, reason)
+        self._event("[%s] CLOSE %s @ %.3f (%+.1f%%, $%+.2f) - %s",
+                    strat, position.team, fill, pnl_pct * 100, pnl, reason)
         self.journal.record_close(strat, position.market_key, position.team,
                                   position.token, position.qty, fill, pnl, pnl_pct, reason)
         cooldown = self.cfg.strategy.stop_loss_cooldown_secs \
@@ -183,15 +193,15 @@ class Engine:
                 if strat == AI:
                     verdict = self.judge.judge(sig, gs)
                     if not verdict.approve:
-                        log.info("[ai] rejected %s: %s", sig.side_team, verdict.reason)
+                        self._event("[ai] rejected %s: %s", sig.side_team, verdict.reason)
                         self.cooldowns[(AI, market.key)] = time.time() + scfg.cooldown_secs
                         continue
                     reason += f" | ai: {verdict.reason} ({verdict.confidence:.2f})"
                 pos = self.broker.open(strat, market.key, sig.token, sig.side_team,
                                        sig.price, stake)
                 if pos:
-                    log.info("[%s] OPEN %s @ %.3f — %s",
-                             strat, sig.side_team, pos.entry_price, reason)
+                    self._event("[%s] OPEN %s @ %.3f - %s",
+                                strat, sig.side_team, pos.entry_price, reason)
                     self.journal.record_open(strat, market.key, sig.side_team,
                                              sig.token, pos.qty, pos.entry_price, reason)
 
@@ -214,3 +224,34 @@ class Engine:
             eq = self.broker.equity(strat, self.latest_prices)
             self.journal.record_equity(strat, eq, self.broker.cash[strat],
                                        len(self.broker.open_positions(strat)))
+
+    def _maybe_log_status(self):
+        now = time.time()
+        if now - self._last_status_log < self.cfg.engine.status_log_interval_secs:
+            return
+        self._last_status_log = now
+        live_games = sum(
+            1 for m in self.markets.values()
+            if (gs := self.game_states.get(m.game_pk)) and gs.is_live
+        )
+        recent_quotes = sum(
+            1 for q in self.latest_quotes.values()
+            if now - q.ts <= max(30.0, self.cfg.engine.poll_interval_secs * 5)
+        )
+        parts = []
+        for strat in self.strategies:
+            eq = self.broker.equity(strat, self.latest_prices)
+            parts.append(
+                f"{strat}: equity=${eq:.2f}, cash=${self.broker.cash[strat]:.2f}, "
+                f"open={len(self.broker.open_positions(strat))}"
+            )
+        log.info(
+            "status: tracked=%d live=%d recent_bbo=%d %s",
+            len(self.markets), live_games, recent_quotes, "; ".join(parts),
+        )
+
+    def _event(self, message: str, *args):
+        text = message % args if args else message
+        self.events.append(text)
+        self.dashboard.record(text)
+        log.info(message, *args)

@@ -67,6 +67,7 @@ class EngineConfig:
     pregame_game_state_window_secs: float = 1800.0  # start live-state checks 30 min pregame
     discovery_interval_secs: float = 1800.0
     equity_snapshot_secs: float = 60.0
+    status_log_interval_secs: float = 300.0
     slippage: float = 0.005              # paper fill: mid +/- this
     live: bool = False
     db_path: str = "polybot.db"

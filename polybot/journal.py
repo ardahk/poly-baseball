@@ -118,5 +118,35 @@ class Journal:
             " ORDER BY ts DESC LIMIT ?", (limit,),
         ).fetchall()
 
+    def db_status(self) -> dict:
+        ticks = self.conn.execute(
+            "SELECT COUNT(*), MAX(ts) FROM price_ticks"
+        ).fetchone()
+        trades = self.conn.execute(
+            "SELECT action, COUNT(*) FROM trades GROUP BY action"
+        ).fetchall()
+        equity = self.conn.execute(
+            "SELECT COUNT(*), MAX(ts) FROM equity"
+        ).fetchone()
+        return {
+            "price_ticks": ticks[0] or 0,
+            "latest_price_ts": ticks[1],
+            "trades": {action: count for action, count in trades},
+            "equity_snapshots": equity[0] or 0,
+            "latest_equity_ts": equity[1],
+        }
+
+    def recent_price_markets(self, limit: int = 10) -> list[tuple]:
+        return self.conn.execute(
+            """SELECT market, home_team, away_team, COUNT(*) AS ticks,
+                      MAX(ts) AS latest_ts, AVG(home_mid) AS avg_mid,
+                      AVG(home_spread) AS avg_spread
+               FROM price_ticks
+               GROUP BY market, home_team, away_team
+               ORDER BY latest_ts DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
     def close(self):
         self.conn.close()
