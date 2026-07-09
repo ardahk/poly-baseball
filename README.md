@@ -78,13 +78,15 @@ Two ways to validate the math on **real finished games** before risking money:
   (predicted probability vs actual home-win rate per bucket). Needs only the
   free MLB API, so it works over many days. If the formula's Brier beats the
   baselines and the calibration buckets line up, the formula is decent.
-- **`backtest strategy`** — attempts to replay Polymarket US 1-minute
-  trade-stat candles for finished games through the exact `check_entry` /
-  `check_exit` code the live bot runs, on a paper broker, and reports simulated
-  P&L. If the exchange does not return historical candles for your access level
-  or the matched games, it exits with a clear message. Treat any strategy P&L as
-  a directional sanity check on thresholds, not a promise. Your real strategy
-  track record accumulates in `report` as you paper-trade.
+- **`backtest strategy`** — replays minute-level prices for finished games
+  through the exact `check_entry` / `check_exit` code the live bot runs, on a
+  paper broker, and reports simulated P&L. It tries Polymarket US 1-minute
+  trade-stat candles first; when those are unavailable (they need exchange data
+  access, and the US gateway drops finished games), it falls back to
+  Polymarket.com history (gamma + CLOB minute prices) for the same games as a
+  proxy. Treat any strategy P&L as a directional sanity check on thresholds,
+  not a promise. Your real strategy track record accumulates in `report` as
+  you paper-trade.
 
 ## How it works
 

@@ -15,20 +15,26 @@ Two modes, both using *real* finished MLB games:
    MLB.
 
 Limitation: Polymarket US historical candles are documented in more than one
-shape and may require exchange data access. This mode attempts the documented
-trade-stats endpoints and fails gracefully (with a clear message) if they are
-not available; `calibrate` (below) needs no exchange data and is the reliable
-way to validate the formula. Even when candles work, ~1-minute resolution
-understates the live bot's edge (2s polling) — treat strategy P&L as
-directional, not precise.
+shape and may require exchange data access, and the US gateway drops finished
+games from its events feed. When US candles are unavailable, strategy replay
+falls back to Polymarket.com (gamma + CLOB) minute-level price history for the
+same games as a proxy; `calibrate` (below) needs no exchange data and is the
+reliable way to validate the formula. Even when prices are available,
+~1-minute resolution understates the live bot's edge (2s polling) — treat
+strategy P&L as directional, not precise.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import statistics
+import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import requests
 
 from . import mlb, pmus, strategy
 from .broker import PaperBroker
@@ -196,6 +202,146 @@ def calibrate(days_back: int = 3, max_games: int = 60) -> None:
     print("lower Brier/log loss than the naive baselines above.")
 
 
+# ------------------------------------------- Polymarket.com history fallback
+#
+# Polymarket US does not return historical candles without exchange data
+# access, and its gateway drops finished games from the events feed. The same
+# games trade on Polymarket.com, whose gamma/CLOB APIs expose minute-level
+# price history publicly, so strategy replay uses those prices as a proxy.
+
+GAMMA_URL = "https://gamma-api.polymarket.com"
+CLOB_URL = "https://clob.polymarket.com"
+
+# MLB Stats API full team name -> abbreviation used in Polymarket.com slugs
+# (mlb-{away}-{home}-{YYYY-MM-DD}).
+TEAM_ABBREV = {
+    "Arizona Diamondbacks": "ari",
+    "Atlanta Braves": "atl",
+    "Baltimore Orioles": "bal",
+    "Boston Red Sox": "bos",
+    "Chicago Cubs": "chc",
+    "Chicago White Sox": "cws",
+    "Cincinnati Reds": "cin",
+    "Cleveland Guardians": "cle",
+    "Colorado Rockies": "col",
+    "Detroit Tigers": "det",
+    "Houston Astros": "hou",
+    "Kansas City Royals": "kc",
+    "Los Angeles Angels": "laa",
+    "Los Angeles Dodgers": "lad",
+    "Miami Marlins": "mia",
+    "Milwaukee Brewers": "mil",
+    "Minnesota Twins": "min",
+    "New York Mets": "nym",
+    "New York Yankees": "nyy",
+    "Athletics": "ath",
+    "Oakland Athletics": "oak",
+    "Philadelphia Phillies": "phi",
+    "Pittsburgh Pirates": "pit",
+    "San Diego Padres": "sd",
+    "San Francisco Giants": "sf",
+    "Seattle Mariners": "sea",
+    "St. Louis Cardinals": "stl",
+    "Tampa Bay Rays": "tb",
+    "Texas Rangers": "tex",
+    "Toronto Blue Jays": "tor",
+    "Washington Nationals": "wsh",
+}
+
+_REQUEST_PACING_SECS = 0.3
+
+
+def _gamma_slug(away_team: str, home_team: str, day: str) -> str | None:
+    """Polymarket.com event slug for a game, or None for unmapped team names."""
+    away = TEAM_ABBREV.get(away_team)
+    home = TEAM_ABBREV.get(home_team)
+    if not away or not home:
+        return None
+    return f"mlb-{away}-{home}-{day}"
+
+
+def _gamma_home_token(event: dict, home_team: str) -> str | None:
+    """CLOB token id of the home team in the event's moneyline market.
+
+    The moneyline is the market whose question equals the event title;
+    clobTokenIds and outcomes are parallel JSON-encoded arrays.
+    """
+    title = event.get("title") or ""
+    for m in event.get("markets") or []:
+        if m.get("question") != title:
+            continue
+        try:
+            tokens = json.loads(m.get("clobTokenIds") or "[]")
+            outcomes = json.loads(m.get("outcomes") or "[]")
+        except (TypeError, ValueError):
+            return None
+        for token, outcome in zip(tokens, outcomes):
+            if mlb._team_match(str(outcome), home_team):
+                return str(token)
+    return None
+
+
+def _slug_dates(game_date: float | None) -> list[str]:
+    """Candidate slug dates for a game. Slugs use the US calendar date, so try
+    the Eastern-time date first, then the UTC date if it differs (late games)."""
+    if game_date is None:
+        return []
+    eastern = datetime.fromtimestamp(game_date, tz=ZoneInfo("America/New_York"))
+    utc = datetime.fromtimestamp(game_date, tz=timezone.utc)
+    days = [eastern.date().isoformat()]
+    if utc.date().isoformat() not in days:
+        days.append(utc.date().isoformat())
+    return days
+
+
+def _fetch_gamma_home_prices(
+    session: requests.Session,
+    away_team: str,
+    home_team: str,
+    game_date: float | None,
+    start_ts: float,
+    end_ts: float,
+) -> tuple[str | None, list[tuple[float, float]]]:
+    """(slug, [(ts, home_price)]) from Polymarket.com minute history, ([], None
+    slug) when the event/market/history isn't available. Paces requests."""
+    for day in _slug_dates(game_date):
+        slug = _gamma_slug(away_team, home_team, day)
+        if not slug:
+            return None, []
+        time.sleep(_REQUEST_PACING_SECS)
+        try:
+            resp = session.get(f"{GAMMA_URL}/events", params={"slug": slug}, timeout=15)
+            resp.raise_for_status()
+            events = resp.json()
+        except Exception as exc:
+            log.debug("gamma event fetch failed for %s: %s", slug, exc)
+            continue
+        if not isinstance(events, list) or not events:
+            continue
+        token = _gamma_home_token(events[0], home_team)
+        if not token:
+            log.debug("no moneyline market found in gamma event %s", slug)
+            continue
+        time.sleep(_REQUEST_PACING_SECS)
+        try:
+            resp = session.get(
+                f"{CLOB_URL}/prices-history",
+                params={"market": token, "startTs": int(start_ts),
+                        "endTs": int(end_ts), "fidelity": 1},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            history = resp.json().get("history") or []
+        except Exception as exc:
+            log.debug("clob price history failed for %s: %s", slug, exc)
+            continue
+        rows = [(float(h["t"]), float(h["p"])) for h in history
+                if isinstance(h, dict) and h.get("t") is not None and h.get("p") is not None]
+        if rows:
+            return slug, rows
+    return None, []
+
+
 # ----------------------------------------------------------- strategy replay
 
 def _state_at(timeline: list[tuple[float, GameState]], ts: float) -> GameState | None:
@@ -290,34 +436,55 @@ def strategy_backtest(cfg: Config, days_back: int = 2, max_games: int = 30) -> N
 
     markets = pmus.fetch_mlb_markets(include_closed=True, limit=400)
     mlb.match_markets_to_games(markets, finished)
-    tradeable = [m for m in markets if m.game_pk][:max_games]
-    print(f"Replaying strategy on {len(tradeable)} finished games with "
-          f"Polymarket US moneyline markets...\n")
-    if not tradeable:
-        print("No finished games currently have a discoverable Polymarket US "
-              "moneyline market. Use `backtest calibrate` to validate the\n"
-              "formula, and run paper mode during live games to accumulate\n"
-              "real strategy results in the journal.")
+    us_by_pk = {m.game_pk: m for m in markets if m.game_pk}
+    games = finished[:max_games]
+    print(f"Replaying strategy on {len(games)} finished games "
+          f"(Polymarket US candles, falling back to Polymarket.com history)...\n")
+    if not games:
+        print("No finished games in the window. Try a larger --days window.")
         return
 
+    session = requests.Session()
     broker = PaperBroker(["backtest"], cfg.risk.starting_cash, cfg.engine.slippage)
     games_with_trades = 0
     games_with_candles = 0
-    for market in tradeable:
-        timeline, home_won = build_state_timeline(client, market.game_pk)
+    for game in games:
+        timeline, home_won = build_state_timeline(client, game["game_pk"])
         if not timeline:
             continue
         start_ts = timeline[0][0] - 3600
         end_ts = timeline[-1][0] + 3600
-        bars = max(1, min(1440, int((end_ts - start_ts) // 60) + 1))
-        long_prices = pmus.fetch_long_price_history(market.slug, start_ts, end_ts, bars=bars)
-        if len(long_prices) < 5:
-            continue
+
+        # Preferred source: Polymarket US 1-minute candles for a matched market.
+        market = us_by_pk.get(game["game_pk"])
+        prices: list[tuple[float, float]] = []
+        if market:
+            bars = max(1, min(1440, int((end_ts - start_ts) // 60) + 1))
+            long_prices = pmus.fetch_long_price_history(
+                market.slug, start_ts, end_ts, bars=bars)
+            prices = [
+                (ts, price if market.home_is_long else 1.0 - price)
+                for ts, price in long_prices
+            ]
+
+        # Fallback: Polymarket.com gamma/CLOB minute history as a proxy.
+        if len(prices) < 5:
+            slug, prices = _fetch_gamma_home_prices(
+                session, game["away"], game["home"], game.get("game_date"),
+                start_ts, end_ts)
+            if len(prices) < 5:
+                log.debug("no usable price history for %s @ %s",
+                          game["away"], game["home"])
+                continue
+            market = Market(
+                slug=slug,
+                question=f"{game['away']} @ {game['home']}",
+                home_team=game["home"],
+                away_team=game["away"],
+                long_team=game["home"],
+                game_pk=game["game_pk"],
+            )
         games_with_candles += 1
-        prices = [
-            (ts, price if market.home_is_long else 1.0 - price)
-            for ts, price in long_prices
-        ]
         before = broker.realized["backtest"]
         n_before = broker.closes["backtest"]
         _replay_game(cfg, market, prices, timeline, home_won, broker)
@@ -327,9 +494,10 @@ def strategy_backtest(cfg: Config, days_back: int = 2, max_games: int = 30) -> N
             print(f"  {market.question:<46} trades P&L ${pnl:+.2f}")
 
     if not games_with_candles:
-        print("No usable Polymarket US historical candles were returned for "
-              "the matched games. That can be an access/API-history limitation,\n"
-              "not necessarily a strategy result. `backtest calibrate` still "
+        print("No usable price history was returned for the finished games — "
+              "neither Polymarket US candles nor Polymarket.com gamma/CLOB\n"
+              "minute history. That can be an access/API-history limitation, "
+              "not necessarily a strategy result. `backtest calibrate` still\n"
               "validates the win-probability formula without exchange data.")
         return
 
