@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 
 from .models import Position
 
@@ -43,7 +44,8 @@ class PaperBroker:
             return None  # already holding this token
         self.cash[strategy] -= cost
         pos = Position(strategy=strategy, market_key=market_key, token=token,
-                       team=team, qty=qty, entry_price=fill)
+                       team=team, qty=qty, entry_price=fill,
+                       trade_id=uuid.uuid4().hex[:12])
         self.positions[strategy][token] = pos
         return pos
 
@@ -163,7 +165,8 @@ class LiveBroker(PaperBroker):
         fill_price, filled_qty = result
         self.cash[strategy] -= filled_qty * fill_price
         pos = Position(strategy=strategy, market_key=market_key, token=token,
-                       team=team, qty=filled_qty, entry_price=fill_price)
+                       team=team, qty=filled_qty, entry_price=fill_price,
+                       trade_id=uuid.uuid4().hex[:12])
         self.positions[strategy][token] = pos
         return pos
 
@@ -185,7 +188,8 @@ class LiveBroker(PaperBroker):
         self.closes[strategy] += 1
         closed_pos = Position(strategy=pos.strategy, market_key=pos.market_key, token=pos.token,
                               team=pos.team, qty=min(filled_qty, pos.qty),
-                              entry_price=pos.entry_price, opened_at=pos.opened_at)
+                              entry_price=pos.entry_price, opened_at=pos.opened_at,
+                              trade_id=pos.trade_id)
         remaining = pos.qty - filled_qty
         if remaining <= 1e-9:
             self.positions[strategy].pop(token, None)

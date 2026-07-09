@@ -101,6 +101,23 @@ class Signal:
 
 
 @dataclass
+class EntryEvaluation:
+    """Structured result of running the entry gates for one market tick."""
+    outcome: str
+    mid: float | None = None
+    move: float | None = None
+    flips: int = 0
+    realized_vol: float = 0.0
+    fair_home: float | None = None
+    side_team: str = ""
+    price: float | None = None
+    fair: float | None = None
+    edge: float | None = None
+    margin: float | None = None
+    signal: Signal | None = None
+
+
+@dataclass
 class Position:
     strategy: str
     market_key: str
@@ -109,6 +126,7 @@ class Position:
     qty: float
     entry_price: float
     opened_at: float = field(default_factory=time.time)
+    trade_id: str = ""
 
     @property
     def cost(self) -> float:

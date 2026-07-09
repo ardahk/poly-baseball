@@ -13,10 +13,12 @@ def broker():
 def test_open_and_close_round_trip(broker):
     pos = broker.open("math", "m1", "tok1", "Homers", 0.50, 10.0)
     assert pos is not None
+    assert pos.trade_id
     assert broker.cash["math"] == pytest.approx(90.0)
     result = broker.close("math", "tok1", 0.60)
     assert result is not None
-    _, fill, pnl = result
+    closed, fill, pnl = result
+    assert closed.trade_id == pos.trade_id
     assert fill == pytest.approx(0.60)
     assert pnl == pytest.approx(2.0)  # 20 shares * 0.10
     assert broker.cash["math"] == pytest.approx(102.0)
@@ -41,6 +43,12 @@ def test_ledgers_are_independent(broker):
 def test_no_duplicate_position(broker):
     assert broker.open("math", "m1", "tok1", "T", 0.50, 10.0) is not None
     assert broker.open("math", "m1", "tok1", "T", 0.50, 10.0) is None
+
+
+def test_trade_ids_are_unique(broker):
+    first = broker.open("math", "m1", "tok1", "T", 0.50, 10.0)
+    second = broker.open("ai", "m1", "tok1", "T", 0.50, 10.0)
+    assert first.trade_id != second.trade_id
 
 
 def test_insufficient_cash(broker):

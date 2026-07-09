@@ -30,8 +30,10 @@ import logging
 import math
 import statistics
 import time
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 import requests
@@ -39,6 +41,7 @@ import requests
 from . import mlb, pmus, strategy
 from .broker import PaperBroker
 from .config import Config
+from .journal import Journal
 from .models import GameState, Market
 from .volatility import PriceHistory
 from .winprob import home_win_probability
@@ -357,7 +360,8 @@ def _state_at(timeline: list[tuple[float, GameState]], ts: float) -> GameState |
 
 def _replay_game(cfg: Config, market: Market, prices: list[tuple[float, float]],
                  timeline: list[tuple[float, GameState]], home_won: bool | None,
-                 broker: PaperBroker) -> None:
+                 broker: PaperBroker,
+                 entry_gate: Callable[[float], bool] | None = None) -> None:
     """Run one game's price+state stream through the live strategy logic."""
     scfg = cfg.strategy
     history = PriceHistory(scfg.flip_band)
@@ -395,6 +399,8 @@ def _replay_game(cfg: Config, market: Market, prices: list[tuple[float, float]],
             break
 
         # --- entries ---
+        if entry_gate is not None and not entry_gate(ts):
+            continue
         if ts < cooldown_until:
             continue
         sig = strategy.check_entry(market, history, gs, scfg)
@@ -518,3 +524,90 @@ def strategy_backtest(cfg: Config, days_back: int = 2, max_games: int = 30) -> N
               f"({100 * realized / (trades * cfg.risk.stake_usd):+.1f}% of stake)")
     print("\nNote: ~1-min price resolution understates the live bot's edge (or")
     print("its whipsaw). Use this to sanity-check thresholds, not as a promise.")
+
+
+def _replay_day_bounds(day: str | None) -> tuple[float, float, str]:
+    selected = date.today() if day is None else datetime.strptime(day, "%Y-%m-%d").date()
+    start_dt = datetime.combine(selected, datetime.min.time())
+    end_dt = start_dt + timedelta(days=1)
+    return start_dt.timestamp(), end_dt.timestamp(), selected.isoformat()
+
+
+def _home_won_from_timeline(timeline: list[tuple[float, GameState]]) -> bool | None:
+    finals = [gs for _, gs in timeline if gs.is_final]
+    if not finals:
+        return None
+    final = finals[-1]
+    if final.home_score == final.away_score:
+        return None
+    return final.home_score > final.away_score
+
+
+def _fresh_bbo_gate(two_sided_ts: list[float], max_age: float) -> Callable[[float], bool]:
+    def gate(ts: float) -> bool:
+        idx = bisect_right(two_sided_ts, ts) - 1
+        return idx >= 0 and ts - two_sided_ts[idx] <= max_age
+    return gate
+
+
+def strategy_replay_db(cfg: Config, db_path: str = "polybot.db",
+                       day: str | None = None) -> None:
+    """Replay a recorded paper-trading day from the SQLite journal."""
+    start, end, label = _replay_day_bounds(day)
+    journal = Journal(db_path)
+    try:
+        markets = journal.markets_between(start, end)
+        print(f"Replaying recorded strategy day {label} from {db_path}...\n")
+        if not markets:
+            print("No recorded markets in this window. Run paper trading during live games first.")
+            return
+
+        broker = PaperBroker(["backtest"], cfg.risk.starting_cash, cfg.engine.slippage)
+        games_with_prices = 0
+        games_with_trades = 0
+        for market in markets:
+            if not market.game_pk:
+                continue
+            ticks = journal.ticks_for_market(market.key, start, end)
+            prices = [(t["ts"], t["home_mid"]) for t in ticks]
+            if not prices:
+                continue
+            timeline = journal.game_state_timeline(market.game_pk, start - 3600, end + 3600)
+            if not timeline:
+                log.debug("no recorded game states for %s", market.key)
+                continue
+            two_sided = [t["ts"] for t in ticks if t["two_sided"]]
+            entry_gate = _fresh_bbo_gate(two_sided, cfg.strategy.max_quote_age_secs)
+            games_with_prices += 1
+            before = broker.realized["backtest"]
+            n_before = broker.closes["backtest"]
+            _replay_game(
+                cfg, market, prices, timeline, _home_won_from_timeline(timeline),
+                broker, entry_gate=entry_gate,
+            )
+            if broker.closes["backtest"] > n_before:
+                games_with_trades += 1
+                pnl = broker.realized["backtest"] - before
+                print(f"  {market.question:<46} replay P&L ${pnl:+.2f}")
+
+        if not games_with_prices:
+            print("No markets had both recorded prices and game states in this window.")
+            return
+
+        realized = broker.realized["backtest"]
+        equity = broker.equity("backtest", {})
+        trades = broker.closes["backtest"]
+        print("\n" + "=" * 60)
+        print("RECORDED-DAY REPLAY RESULTS")
+        print("=" * 60)
+        print(f"markets replayed   : {games_with_prices}")
+        print(f"markets with trades: {games_with_trades}")
+        print(f"round-trip trades  : {trades}")
+        print(f"realized P&L       : ${realized:+.2f}")
+        print(f"account            : ${cfg.risk.starting_cash:.2f} -> ${equity:.2f} "
+              f"({100 * (equity - cfg.risk.starting_cash) / cfg.risk.starting_cash:+.1f}%)")
+        if trades:
+            print(f"avg P&L per trade  : ${realized / trades:+.2f} "
+                  f"({100 * realized / (trades * cfg.risk.stake_usd):+.1f}% of stake)")
+    finally:
+        journal.close()

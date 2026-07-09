@@ -95,6 +95,7 @@ class Engine:
         for m in new:
             if m.game_pk:
                 self.markets[m.key] = m
+                self.journal.record_market(m)
                 self.histories[m.key] = PriceHistory(self.cfg.strategy.flip_band)
                 self._event("tracking: %s (game %s)", m.question, m.game_pk)
 
@@ -112,7 +113,10 @@ class Engine:
                 continue
             gs = self.mlb.game_state(market.game_pk)
             if gs:
+                previous = self.game_states.get(market.game_pk)
                 self.game_states[market.game_pk] = gs
+                if gs != previous:
+                    self.journal.record_game_state(gs)
 
     def _should_poll_game_state(self, market: Market, now: float) -> bool:
         current = self.game_states.get(market.game_pk)
@@ -143,6 +147,7 @@ class Engine:
                 # but leave latest_quotes stale so entries stay blocked.
                 home_mid = book.long_last if market.home_is_long \
                     else 1.0 - book.long_last
+                self.journal.record_mark(market, home_mid, book.long_last)
             else:
                 continue
             self.histories[market.key].add(home_mid)
@@ -180,9 +185,10 @@ class Engine:
                     pos, price, fair, bool(gs and gs.is_final), self.cfg.strategy
                 )
                 if reason:
-                    self._close(strat, pos, price, reason)
+                    self._close(strat, pos, price, reason, fair=fair)
 
-    def _close(self, strat: str, pos, price: float, reason: str):
+    def _close(self, strat: str, pos, price: float, reason: str,
+               fair: float | None = None):
         result = self.broker.close(strat, pos.token, price)
         if result is None:
             return
@@ -191,7 +197,10 @@ class Engine:
         self._event("[%s] CLOSE %s @ %.3f (%+.1f%%, $%+.2f) - %s",
                     strat, position.team, fill, pnl_pct * 100, pnl, reason)
         self.journal.record_close(strat, position.market_key, position.team,
-                                  position.token, position.qty, fill, pnl, pnl_pct, reason)
+                                  position.token, position.qty, fill, pnl, pnl_pct, reason,
+                                  trade_id=position.trade_id, fair=fair,
+                                  intended_price=price, slippage=fill - price,
+                                  exit_kind=strategy.exit_kind(reason))
         cooldown = self.cfg.strategy.stop_loss_cooldown_secs \
             if reason.startswith("stop loss") else self.cfg.strategy.cooldown_secs
         self.cooldowns[(strat, position.market_key)] = time.time() + cooldown
@@ -201,9 +210,42 @@ class Engine:
     def _bump(self, reason: str) -> None:
         self.funnel[reason] = self.funnel.get(reason, 0) + 1
 
+    def _decision_row(self, market: Market, gs: GameState, stage: str, outcome: str,
+                      *, strategy_name: str | None = None,
+                      ev=None, quote: MarketQuote | None = None,
+                      quote_age: float | None = None,
+                      margin: float | None = None, ts: float | None = None) -> dict:
+        history = self.histories.get(market.key)
+        return {
+            "ts": time.time() if ts is None else ts,
+            "market": market.key,
+            "strategy": strategy_name,
+            "stage": stage,
+            "outcome": outcome,
+            "mid": ev.mid if ev else (history.last if history else None),
+            "move": ev.move if ev else None,
+            "flips": ev.flips if ev else (history.flips if history else None),
+            "realized_vol": ev.realized_vol if ev else (
+                history.realized_vol(self.cfg.strategy.vol_window) if history else None
+            ),
+            "fair_home": ev.fair_home if ev else None,
+            "side": ev.side_team if ev else None,
+            "price": ev.price if ev else None,
+            "fair": ev.fair if ev else None,
+            "edge": ev.edge if ev else None,
+            "spread": quote.home_spread if quote else None,
+            "quote_age": quote_age,
+            "margin": ev.margin if margin is None and ev else margin,
+            "inning": gs.inning,
+            "is_top": int(gs.is_top),
+            "home_score": gs.home_score,
+            "away_score": gs.away_score,
+        }
+
     def _look_for_entries(self):
         scfg = self.cfg.strategy
         now = time.time()
+        rows: list[dict] = []
         for market in self.markets.values():
             gs = self.game_states.get(market.game_pk)
             if not gs or not gs.is_live:
@@ -211,30 +253,69 @@ class Engine:
             quote = self.latest_quotes.get(market.key)
             if quote is None or now - quote.ts > scfg.max_quote_age_secs:
                 self._bump("stale_quote")
+                quote_age = (now - quote.ts) if quote else None
+                rows.append(self._decision_row(
+                    market, gs, "engine", "stale_quote", quote=quote,
+                    quote_age=quote_age,
+                    margin=(scfg.max_quote_age_secs - quote_age)
+                    if quote_age is not None else None,
+                    ts=now,
+                ))
                 continue
             if quote.home_spread > scfg.max_spread:
                 self._bump("wide_spread")
+                rows.append(self._decision_row(
+                    market, gs, "engine", "wide_spread", quote=quote,
+                    quote_age=now - quote.ts,
+                    margin=scfg.max_spread - quote.home_spread,
+                    ts=now,
+                ))
                 continue
-            sig = strategy.check_entry(market, self.histories[market.key], gs, scfg,
-                                       funnel=self.funnel)
+            ev = strategy.evaluate_entry(market, self.histories[market.key], gs, scfg)
+            self._bump(ev.outcome)
+            rows.append(self._decision_row(
+                market, gs, "strategy", ev.outcome, ev=ev, quote=quote,
+                quote_age=now - quote.ts, ts=now,
+            ))
+            sig = ev.signal
             if sig is None:
                 continue
             for strat in self.strategies:
                 if time.time() < self.cooldowns.get((strat, market.key), 0):
                     self._bump("cooldown")
+                    rows.append(self._decision_row(
+                        market, gs, "post_signal", "cooldown",
+                        strategy_name=strat, ev=ev, quote=quote,
+                        quote_age=now - quote.ts, ts=now,
+                    ))
                     continue
                 if sig.token in self.broker.positions[strat]:
                     self._bump("already_open")
+                    rows.append(self._decision_row(
+                        market, gs, "post_signal", "already_open",
+                        strategy_name=strat, ev=ev, quote=quote,
+                        quote_age=now - quote.ts, ts=now,
+                    ))
                     continue
                 stake = self._stake_for_signal(sig, quote)
                 if not self.risk.can_open(self.broker, strat, market.key, stake):
                     self._bump("risk_blocked")
+                    rows.append(self._decision_row(
+                        market, gs, "post_signal", "risk_blocked",
+                        strategy_name=strat, ev=ev, quote=quote,
+                        quote_age=now - quote.ts, ts=now,
+                    ))
                     continue
                 reason = f"{sig.reason}; spread {quote.home_spread:.3f}; stake ${stake:.0f}"
                 if strat == AI:
                     verdict = self.judge.judge(sig, gs)
                     if not verdict.approve:
                         self._bump("ai_rejected")
+                        rows.append(self._decision_row(
+                            market, gs, "post_signal", "ai_rejected",
+                            strategy_name=strat, ev=ev, quote=quote,
+                            quote_age=now - quote.ts, ts=now,
+                        ))
                         self._event("[ai] rejected %s: %s", sig.side_team, verdict.reason)
                         self.cooldowns[(AI, market.key)] = time.time() + scfg.cooldown_secs
                         continue
@@ -243,10 +324,27 @@ class Engine:
                                        sig.price, stake)
                 if pos:
                     self._bump("opened")
+                    rows.append(self._decision_row(
+                        market, gs, "post_signal", "opened",
+                        strategy_name=strat, ev=ev, quote=quote,
+                        quote_age=now - quote.ts, ts=now,
+                    ))
                     self._event("[%s] OPEN %s @ %.3f - %s",
                                 strat, sig.side_team, pos.entry_price, reason)
                     self.journal.record_open(strat, market.key, sig.side_team,
-                                             sig.token, pos.qty, pos.entry_price, reason)
+                                             sig.token, pos.qty, pos.entry_price, reason,
+                                             trade_id=pos.trade_id, fair=sig.fair,
+                                             edge=sig.edge, move=sig.move,
+                                             spread=quote.home_spread,
+                                             intended_price=sig.price,
+                                             slippage=pos.entry_price - sig.price)
+                else:
+                    rows.append(self._decision_row(
+                        market, gs, "post_signal", "open_failed",
+                        strategy_name=strat, ev=ev, quote=quote,
+                        quote_age=now - quote.ts, ts=now,
+                    ))
+        self.journal.record_decisions(rows)
 
     def _stake_for_signal(self, sig, quote: MarketQuote) -> float:
         rcfg = self.cfg.risk

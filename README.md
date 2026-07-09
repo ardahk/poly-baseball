@@ -35,20 +35,34 @@ python main.py scan          # what MLB markets exist right now + model fair val
 python main.py run           # paper trade (default, no keys needed)
 python main.py run --dashboard # paper trade with a live terminal dashboard
 python main.py report        # math-vs-AI performance comparison
+python main.py review        # end-of-day trade/funnel/near-miss review
 python main.py run --live    # real orders — requires pip install polymarket-us + keys
 python main.py run --live --yes-live  # real orders without prompt for systemd
 
 python main.py backtest calibrate --days 7   # is the win-prob formula accurate?
 python main.py backtest strategy  --days 1   # would the trading logic have profited?
+python main.py backtest replay --date 2026-07-08 --set strategy.stop_loss=0.15
 ```
 
 Run it during live MLB games (evenings US time); outside game hours there is
-nothing to trade. Trades, equity snapshots, and every observed best-bid /
-best-ask price tick are logged to `polybot.db` (SQLite); `report` prints win
-rate, average % per trade, best/worst, and account return per strategy.
+nothing to trade. Trades, equity snapshots, every observed best-bid/best-ask
+tick, one-sided mark prices, game-state changes, market metadata, and every
+entry decision/rejection are logged to `polybot.db` (SQLite). `report` prints
+win rate, average % per trade, best/worst, and account return per strategy;
+`review` explains the day with linked round trips, MFE/MAE, exit breakdowns,
+the persisted entry funnel, near misses, and threshold hints.
 Use `run --dashboard` during a game for a live terminal view of tracked games,
 fresh BBO counts, strategy equity, market state, open positions, and recent
 engine events.
+
+The first command that opens an older `polybot.db` migrates it in place. The
+migration is additive, but copy the DB aside first if it contains data you care
+about:
+
+```bash
+cp polybot.db "polybot.db.backup-$(date +%Y%m%d)"
+python main.py status
+```
 
 For unattended live mode, either use `--yes-live` in the service command or set
 `POLYBOT_CONFIRM_LIVE=yes` in `.env`. Manual `--live` runs still prompt by
@@ -65,7 +79,9 @@ take-profit band, playfulness definition, stake sizing, and risk limits
 If the bot isn't trading, look at the **entry funnel** — a counter of why
 each candidate tick was rejected (`not_playful`, `small_move`, `no_edge`,
 `early_game`, `stale_quote`, `wide_spread`, ...). It's on the dashboard and
-in the periodic status log line, so "no trades" is always diagnosable.
+in the periodic status log line. The same gate outcomes are persisted in the
+`decisions` table, so `python main.py review --date YYYY-MM-DD` can diagnose a
+losing or quiet day after the process exits.
 
 ## Backtesting
 
@@ -87,16 +103,22 @@ Two ways to validate the math on **real finished games** before risking money:
   proxy. Treat any strategy P&L as a directional sanity check on thresholds,
   not a promise. Your real strategy track record accumulates in `report` as
   you paper-trade.
+- **`backtest replay`** — replays the bot's own recorded SQLite day using the
+  observed tick stream, including one-sided mark prices for move detection and
+  a fresh two-sided-BBO gate for entries. Repeat `--set section.key=value` to
+  sweep thresholds without editing `config.yaml`, for example
+  `python main.py backtest replay --date 2026-07-08 --set strategy.stop_loss=0.15`.
 
 ## How it works
 
 - **Market discovery**: Polymarket US sports gateway (`/v2/leagues/mlb/events`),
   matched to MLB Stats API games by team name and scheduled start time.
 - **Prices**: Polymarket US market BBO midpoints polled every ~2s per market.
-  Every BBO tick is recorded so future backtests can replay the bot's own
-  observed market history. To avoid noisy API usage, BBO polling only starts
-  once MLB reports a game as live; game-state checks begin shortly before first
-  pitch.
+  Every two-sided BBO tick is recorded with `two_sided=1, source='bbo'`; when a
+  live book is one-sided, the mark/last price is recorded with
+  `two_sided=0, source='mark'` so replay sees the same price history the live
+  strategy saw. To avoid noisy API usage, price polling only starts once MLB
+  reports a game as live; game-state checks begin shortly before first pitch.
 - **Fair value**: normal model of the final run differential using a
   run-expectancy (RE24) adjustment for the current base/out state.
 - **Playfulness**: only trades games whose price has crossed 50% repeatedly

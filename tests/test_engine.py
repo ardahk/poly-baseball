@@ -35,6 +35,7 @@ def test_two_sided_book_records_quote_and_history(tmp_path):
     assert engine.latest_quotes[market.key].home_mid == 0.51
     assert engine.histories[market.key].last == 0.51
     assert engine.latest_prices[market.away_token] == 0.49
+    assert engine.journal.ticks_for_market(market.key)[0]["source"] == "bbo"
 
 
 def test_one_sided_book_keeps_history_alive_without_quote(tmp_path):
@@ -46,6 +47,9 @@ def test_one_sided_book_keeps_history_alive_without_quote(tmp_path):
 
     assert market.key not in engine.latest_quotes  # untradeable, no fresh BBO
     assert engine.histories[market.key].last == 0.01  # but tracking continues
+    tick = engine.journal.ticks_for_market(market.key)[0]
+    assert tick["source"] == "mark"
+    assert tick["two_sided"] == 0
 
 
 def test_short_home_side_inverts_book(tmp_path):
@@ -89,3 +93,4 @@ def test_discovery_only_tracks_matched_markets(tmp_path):
     assert "m-yes" in engine.markets
     assert engine.markets["m-yes"].game_pk == 7
     assert "m-no" not in engine.markets
+    assert engine.journal.markets_between(0, time.time() + 1)[0].slug == "m-yes"

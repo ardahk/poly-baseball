@@ -3,7 +3,7 @@ import time
 
 from polybot.config import StrategyConfig
 from polybot.models import GameState, Market, Position
-from polybot.strategy import check_entry, check_exit
+from polybot.strategy import check_entry, check_exit, evaluate_entry, exit_kind
 from polybot.volatility import PriceHistory
 
 
@@ -138,6 +138,47 @@ def test_funnel_counts_reject_reasons():
     gs = live_gs(inning=7, is_top=True, home_score=4, away_score=1)
     assert check_entry(make_market(), h, gs, CFG, funnel=funnel) is not None
     assert funnel["signal"] == 1
+
+
+def test_evaluate_entry_reports_gate_margin_for_no_edge():
+    h = playful_history([0.60, 0.40, 0.60, 0.60, 0.40])
+    gs = live_gs(inning=7, is_top=True, home_score=1, away_score=4)
+    ev = evaluate_entry(make_market(), h, gs, CFG)
+    assert ev.outcome == "no_edge"
+    assert ev.signal is None
+    assert ev.margin < 0
+    assert ev.edge is not None
+
+
+def test_evaluate_entry_reports_signal_and_wrapper_equivalence():
+    h = playful_history([0.60, 0.40, 0.60, 0.60, 0.40])
+    gs = live_gs(inning=7, is_top=True, home_score=4, away_score=1)
+    ev = evaluate_entry(make_market(), h, gs, CFG)
+    wrapped = check_entry(make_market(), h, gs, CFG)
+    assert ev.outcome == "signal"
+    assert ev.signal is not None
+    assert wrapped is not None
+    assert ev.signal.token == wrapped.token
+    assert ev.margin == pytest.approx(ev.edge - CFG.min_edge)
+
+
+def test_evaluate_entry_reports_not_playful_margin():
+    h = PriceHistory(flip_band=0.03)
+    h.add(0.50, ts=0)
+    h.add(0.51, ts=30)
+    gs = live_gs(inning=7, is_top=True, home_score=4, away_score=1)
+    ev = evaluate_entry(make_market(), h, gs, CFG)
+    assert ev.outcome == "not_playful"
+    assert ev.margin == pytest.approx(ev.realized_vol - CFG.min_volatility)
+
+
+def test_exit_kind_prefix_mapping():
+    assert exit_kind("take profit +12.0%") == "take_profit"
+    assert exit_kind("stop loss -10.0%") == "stop_loss"
+    assert exit_kind("time stop +1.0%") == "time_stop"
+    assert exit_kind("edge gone") == "edge_gone"
+    assert exit_kind("game final") == "game_final"
+    assert exit_kind("manual") == "other"
 
 
 def test_home_fair_shrink_lowers_home_fair():

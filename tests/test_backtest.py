@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from polybot.backtest import (
     _CalibResult,
     _brier,
@@ -5,9 +7,14 @@ from polybot.backtest import (
     _gamma_slug,
     _logloss,
     _naive_leader,
+    _replay_game,
     _state_at,
+    strategy_replay_db,
 )
-from polybot.models import GameState
+from polybot.broker import PaperBroker
+from polybot.config import Config
+from polybot.journal import Journal
+from polybot.models import GameState, Market, MarketQuote
 
 
 def test_brier_perfect_and_worst():
@@ -93,3 +100,82 @@ def test_state_at_returns_most_recent():
     assert _state_at(tl, 150.0).inning == 1
     assert _state_at(tl, 250.0).inning == 3
     assert _state_at(tl, 999.0).inning == 5
+
+
+def replay_cfg():
+    cfg = Config()
+    cfg.ai.enabled = False
+    cfg.strategy.move_lookback_secs = 60
+    cfg.strategy.move_threshold = 0.08
+    cfg.strategy.min_edge = 0.05
+    cfg.strategy.min_flips = 2
+    cfg.strategy.min_volatility = 99.0
+    cfg.strategy.max_quote_age_secs = 30
+    cfg.engine.slippage = 0.0
+    return cfg
+
+
+def replay_market():
+    return Market("m1", "Homers vs Awayers", "Homers", "Awayers",
+                  "Homers", game_pk=1)
+
+
+def replay_timeline(base=1000.0):
+    return [
+        (base, GameState(1, inning=7, is_top=True, home_score=5, away_score=1,
+                         status="Live")),
+        (base + 240, GameState(1, inning=9, is_top=False, home_score=5, away_score=1,
+                               status="Final")),
+    ]
+
+
+def replay_prices(base=1000.0):
+    return [
+        (base, 0.60),
+        (base + 30, 0.40),
+        (base + 60, 0.60),
+        (base + 90, 0.60),
+        (base + 120, 0.40),
+    ]
+
+
+def test_replay_game_entry_gate_blocks_entries():
+    cfg = replay_cfg()
+    broker = PaperBroker(["backtest"], 100.0, slippage=0.0)
+    _replay_game(
+        cfg, replay_market(), replay_prices(), replay_timeline(), True, broker,
+        entry_gate=lambda ts: False,
+    )
+    assert broker.closes["backtest"] == 0
+
+
+def test_strategy_replay_db_uses_recorded_day(tmp_path, capsys):
+    cfg = replay_cfg()
+    db_path = tmp_path / "replay.db"
+    cfg.engine.db_path = str(db_path)
+    journal = Journal(str(db_path))
+    base = datetime(2026, 7, 8, 12, 0, 0).timestamp()
+    market = replay_market()
+    try:
+        journal.record_market(market, ts=base)
+        for ts, gs in replay_timeline(base):
+            journal.record_game_state(gs, ts=ts)
+        for ts, price in replay_prices(base):
+            journal.record_price(
+                market,
+                MarketQuote(
+                    market.key,
+                    price - 0.01,
+                    price + 0.01,
+                    price - 0.01,
+                    price + 0.01,
+                    ts=ts,
+                ),
+            )
+    finally:
+        journal.close()
+
+    strategy_replay_db(cfg, str(db_path), day="2026-07-08")
+    output = capsys.readouterr().out
+    assert "RECORDED-DAY REPLAY RESULTS" in output
+    assert "round-trip trades  : 1" in output
