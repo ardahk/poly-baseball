@@ -236,7 +236,7 @@ def _replay_game(cfg: Config, market: Market, prices: list[tuple[float, float]],
             price = home_price if pos.token == market.home_token else 1.0 - home_price
             fair = None
             if gs:
-                fh = home_win_probability(gs)
+                fh = strategy.fair_home_value(gs, scfg)
                 fair = fh if pos.token == market.home_token else 1.0 - fh
             reason = strategy.check_exit(pos, price, fair, game_final, scfg, now=ts)
             if reason:

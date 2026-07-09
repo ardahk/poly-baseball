@@ -12,11 +12,18 @@ from .winprob import home_win_probability
 log = logging.getLogger(__name__)
 
 
+def fair_home_value(game_state: GameState, cfg: StrategyConfig) -> float:
+    """Model P(home win) with the configured home-bias correction applied."""
+    fair = home_win_probability(game_state) - cfg.home_fair_shrink
+    return min(max(fair, 0.001), 0.999)
+
+
 def check_entry(
     market: Market,
     history: PriceHistory,          # history of the HOME token price
     game_state: GameState | None,
     cfg: StrategyConfig,
+    funnel: dict[str, int] | None = None,   # optional reject-reason counters
 ) -> Signal | None:
     """Return a buy signal if the market just overreacted vs the model.
 
@@ -24,18 +31,26 @@ def check_entry(
     the model disagrees with the new price by at least `min_edge` in the
     opposite direction of the move -> buy the undervalued side.
     """
+    def reject(reason: str) -> None:
+        if funnel is not None:
+            funnel[reason] = funnel.get(reason, 0) + 1
+
     if game_state is None or not game_state.is_live:
+        reject("not_live")
         return None
     mid = history.last
     if mid is None:
+        reject("no_price")
         return None
     if not history.is_playful(cfg.min_flips, cfg.min_volatility, cfg.vol_window):
+        reject("not_playful")
         return None
     move = history.move(cfg.move_lookback_secs)
     if move is None or abs(move) < cfg.move_threshold:
+        reject("small_move")
         return None
 
-    fair_home = home_win_probability(game_state)
+    fair_home = fair_home_value(game_state, cfg)
 
     if move < 0 and fair_home - mid >= cfg.min_edge:
         token, team, price, fair = market.home_token, market.home_team, mid, fair_home
@@ -44,17 +59,21 @@ def check_entry(
         token, team = market.away_token, market.away_team
         price, fair = 1.0 - mid, 1.0 - fair_home
     else:
+        reject("no_edge")
         return None
 
     if not (cfg.min_price <= price <= cfg.max_price):
+        reject("price_band")
         return None
     edge = fair - price
     if game_state.inning <= cfg.early_game_max_inning:
         fair_extreme = fair >= cfg.early_game_min_fair_extreme \
             or fair <= 1.0 - cfg.early_game_min_fair_extreme
         if edge < cfg.early_game_min_edge or not fair_extreme:
+            reject("early_game")
             return None
 
+    reject("signal")
     return Signal(
         market=market, token=token, side_team=team,
         price=price, fair=fair, move=move,

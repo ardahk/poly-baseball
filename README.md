@@ -59,6 +59,13 @@ default.
 All knobs are in `config.yaml` with comments — entry thresholds, the 5–30%
 take-profit band, playfulness definition, stake sizing, and risk limits
 (max concurrent positions, per-market cap, and daily-loss kill switch).
+`home_fair_shrink` corrects the win-prob formula's home-team bias
+(`backtest calibrate` showed homes overpredicted by ~5-9 points mid-range).
+
+If the bot isn't trading, look at the **entry funnel** — a counter of why
+each candidate tick was rejected (`not_playful`, `small_move`, `no_edge`,
+`early_game`, `stale_quote`, `wide_spread`, ...). It's on the dashboard and
+in the periodic status log line, so "no trades" is always diagnosable.
 
 ## Backtesting
 

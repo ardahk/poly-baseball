@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import requests
@@ -37,14 +38,33 @@ def _parse_iso(raw) -> float | None:
         return None
 
 
-def fetch_mlb_markets(
+@dataclass
+class BookQuote:
+    """Long-side book snapshot embedded in the bulk events response."""
+    long_bid: float | None
+    long_ask: float | None
+    long_last: float | None   # last/mark price fallback when the book is one-sided
+
+    @property
+    def two_sided(self) -> bool:
+        return self.long_bid is not None and self.long_ask is not None \
+            and self.long_bid <= self.long_ask
+
+
+def fetch_mlb_book(
     session: requests.Session | None = None,
     limit: int = 100,
     include_closed: bool = False,
-) -> list[Market]:
-    """Fetch today's/upcoming MLB moneyline markets."""
+) -> tuple[list[Market], dict[str, BookQuote]]:
+    """Fetch MLB moneyline markets AND their current quotes in ONE request.
+
+    The events payload embeds bestBidQuote/bestAskQuote per market, so the
+    engine can refresh every market's BBO with a single gateway call per poll
+    tick instead of one /bbo request per market (a big rate-limit win).
+    """
     sess = session or requests.Session()
     markets: list[Market] = []
+    quotes: dict[str, BookQuote] = {}
     try:
         resp = sess.get(
             f"{GATEWAY_URL}/v2/leagues/mlb/events", params={"limit": limit}, timeout=15
@@ -53,7 +73,7 @@ def fetch_mlb_markets(
         data = resp.json()
     except Exception as exc:
         log.warning("Polymarket US discovery failed: %s", exc)
-        return markets
+        return markets, quotes
 
     for event in data.get("events", []):
         for m in event.get("markets", []):
@@ -62,8 +82,38 @@ def fetch_mlb_markets(
             market = _parse_market(m, include_closed=include_closed)
             if market:
                 markets.append(market)
+                quotes[market.slug] = _parse_book_quote(m)
+    log.debug("Polymarket US: %d MLB moneyline markets discovered", len(markets))
+    return markets, quotes
+
+
+def fetch_mlb_markets(
+    session: requests.Session | None = None,
+    limit: int = 100,
+    include_closed: bool = False,
+) -> list[Market]:
+    """Fetch today's/upcoming MLB moneyline markets."""
+    markets, _ = fetch_mlb_book(session, limit=limit, include_closed=include_closed)
     log.info("Polymarket US: %d MLB moneyline markets discovered", len(markets))
     return markets
+
+
+def _quote_value(raw) -> float | None:
+    if not isinstance(raw, dict):
+        return None
+    return _price(raw.get("value"))
+
+
+def _parse_book_quote(m: dict) -> BookQuote:
+    long_last = None
+    for side in m.get("marketSides") or []:
+        if side.get("long"):
+            long_last = _price(side.get("price"))
+    return BookQuote(
+        long_bid=_quote_value(m.get("bestBidQuote")),
+        long_ask=_quote_value(m.get("bestAskQuote")),
+        long_last=long_last,
+    )
 
 
 def _parse_market(m: dict, include_closed: bool = False) -> Market | None:

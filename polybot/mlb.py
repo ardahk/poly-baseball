@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -42,8 +42,18 @@ class MLBClient:
         return games
 
     def todays_games(self) -> list[dict]:
-        """[{game_pk, home, away, status, game_date}] for today's schedule."""
-        return self.schedule(date.today().isoformat())
+        """[{game_pk, home, away, status, game_date}] for yesterday through tomorrow.
+
+        The range (rather than just today) matters: MLB schedule dates are
+        US-calendar based, so on a UTC host a 7pm PT game belongs to
+        "yesterday" once the clock passes midnight UTC. Querying a single
+        local date silently drops in-progress evening games.
+        """
+        today = date.today()
+        return self.schedule(
+            (today - timedelta(days=1)).isoformat(),
+            (today + timedelta(days=1)).isoformat(),
+        )
 
     def game_state(self, game_pk: int) -> GameState | None:
         try:
@@ -92,19 +102,30 @@ _MATCH_WINDOW_SECS = 6 * 3600
 
 
 def match_markets_to_games(markets: list[Market], games: list[dict]) -> None:
-    """Attach MLB game_pk to each market by team names + start time (in place)."""
+    """Attach MLB game_pk to each market by team names + start time (in place).
+
+    The schedule may span several days of the same series (same two teams),
+    so among team-name matches pick the game whose start time is closest to
+    the market's, and require it inside the match window.
+    """
     for market in markets:
         if market.game_pk:
             continue
+        best_pk, best_gap = None, None
         for game in games:
             if not (_team_match(market.home_team, game["home"])
                     and _team_match(market.away_team, game["away"])):
                 continue
-            if (market.start_time is not None and game.get("game_date") is not None
-                    and abs(market.start_time - game["game_date"]) > _MATCH_WINDOW_SECS):
+            if market.start_time is None or game.get("game_date") is None:
+                if best_pk is None:
+                    best_pk = game["game_pk"]
                 continue
-            market.game_pk = game["game_pk"]
-            break
+            gap = abs(market.start_time - game["game_date"])
+            if gap > _MATCH_WINDOW_SECS:
+                continue
+            if best_gap is None or gap < best_gap:
+                best_pk, best_gap = game["game_pk"], gap
+        market.game_pk = best_pk
         if not market.game_pk:
             log.debug("no MLB game matched for market %r", market.question)
 

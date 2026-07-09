@@ -14,8 +14,6 @@ from .journal import Journal
 from .models import GameState, Market, MarketQuote
 from .risk import RiskManager
 from .volatility import PriceHistory
-from .winprob import home_win_probability
-
 log = logging.getLogger(__name__)
 
 MATH = "math"
@@ -35,7 +33,6 @@ class Engine:
                                  cfg.engine.slippage)
         self.risk = RiskManager(cfg.risk, self.strategies)
         self.journal = Journal(cfg.engine.db_path)
-        self.feed = pmus.PriceFeed()
         self.mlb = mlb.MLBClient()
 
         self.markets: dict[str, Market] = {}
@@ -44,6 +41,7 @@ class Engine:
         self.cooldowns: dict[tuple[str, str], float] = {}  # (strategy, market) -> reopen ts
         self.latest_prices: dict[str, float] = {}          # token -> price
         self.latest_quotes: dict[str, MarketQuote] = {}    # market_key -> latest BBO
+        self.funnel: dict[str, int] = {}                   # entry-gate reject counters
 
         self._last_discovery = 0.0
         self._last_game_poll = 0.0
@@ -62,9 +60,11 @@ class Engine:
         try:
             while True:
                 tick_start = time.time()
-                self._maybe_discover()
+                # One bulk request refreshes every market's BBO per tick.
+                found, quotes = pmus.fetch_mlb_book()
+                self._maybe_discover(found)
                 self._maybe_poll_games()
-                self._poll_prices()
+                self._poll_prices(quotes)
                 self._manage_exits()
                 self._look_for_entries()
                 self._maybe_snapshot_equity()
@@ -80,17 +80,20 @@ class Engine:
 
     # ------------------------------------------------------------- discovery
 
-    def _maybe_discover(self):
+    def _maybe_discover(self, found: list[Market]):
+        """Match newly seen markets to MLB games (throttled: hits the MLB API)."""
         now = time.time()
+        new = [m for m in found if m.key not in self.markets]
+        if not new:
+            return
         if now - self._last_discovery < self.cfg.engine.discovery_interval_secs \
                 and self.markets:
             return
         self._last_discovery = now
-        found = pmus.fetch_mlb_markets()
         games = self.mlb.todays_games()
-        mlb.match_markets_to_games(found, games)
-        for m in found:
-            if m.game_pk and m.key not in self.markets:
+        mlb.match_markets_to_games(new, games)
+        for m in new:
+            if m.game_pk:
                 self.markets[m.key] = m
                 self.histories[m.key] = PriceHistory(self.cfg.strategy.flip_band)
                 self._event("tracking: %s (game %s)", m.question, m.game_pk)
@@ -121,19 +124,43 @@ class Engine:
             return True
         return now >= market.start_time - self.cfg.engine.pregame_game_state_window_secs
 
-    def _poll_prices(self):
+    def _poll_prices(self, quotes: dict[str, pmus.BookQuote]):
         for market in self.markets.values():
             gs = self.game_states.get(market.game_pk)
             if not gs or not gs.is_live:
                 continue
-            quote = self.feed.quote(market)
-            if quote is None:
+            book = quotes.get(market.slug)
+            if book is None:
                 continue
-            self.journal.record_price(market, quote)
-            self.latest_quotes[market.key] = quote
-            self.histories[market.key].add(quote.home_mid)
-            self.latest_prices[market.home_token] = quote.home_mid
-            self.latest_prices[market.away_token] = 1.0 - quote.home_mid
+            if book.two_sided:
+                quote = self._to_home_quote(market, book)
+                self.journal.record_price(market, quote)
+                self.latest_quotes[market.key] = quote
+                home_mid = quote.home_mid
+            elif book.long_last is not None:
+                # One-sided book (common mid-play): keep the price history
+                # alive from the mark price so move detection doesn't freeze,
+                # but leave latest_quotes stale so entries stay blocked.
+                home_mid = book.long_last if market.home_is_long \
+                    else 1.0 - book.long_last
+            else:
+                continue
+            self.histories[market.key].add(home_mid)
+            self.latest_prices[market.home_token] = home_mid
+            self.latest_prices[market.away_token] = 1.0 - home_mid
+
+    @staticmethod
+    def _to_home_quote(market: Market, book: pmus.BookQuote) -> MarketQuote:
+        if market.home_is_long:
+            home_bid, home_ask = book.long_bid, book.long_ask
+        else:
+            home_bid, home_ask = 1.0 - book.long_ask, 1.0 - book.long_bid
+        return MarketQuote(
+            market_key=market.key,
+            home_bid=home_bid, home_ask=home_ask,
+            long_bid=book.long_bid, long_ask=book.long_ask,
+            ts=time.time(),
+        )
 
     # ----------------------------------------------------------------- exits
 
@@ -147,7 +174,7 @@ class Engine:
                 gs = self.game_states.get(market.game_pk)
                 fair = None
                 if gs:
-                    fair_home = home_win_probability(gs)
+                    fair_home = strategy.fair_home_value(gs, self.cfg.strategy)
                     fair = fair_home if pos.token == market.home_token else 1.0 - fair_home
                 reason = strategy.check_exit(
                     pos, price, fair, bool(gs and gs.is_final), self.cfg.strategy
@@ -171,28 +198,43 @@ class Engine:
 
     # --------------------------------------------------------------- entries
 
+    def _bump(self, reason: str) -> None:
+        self.funnel[reason] = self.funnel.get(reason, 0) + 1
+
     def _look_for_entries(self):
         scfg = self.cfg.strategy
+        now = time.time()
         for market in self.markets.values():
             gs = self.game_states.get(market.game_pk)
+            if not gs or not gs.is_live:
+                continue  # not counted: pending/final markets aren't candidates
             quote = self.latest_quotes.get(market.key)
-            if quote is None or quote.home_spread > scfg.max_spread:
+            if quote is None or now - quote.ts > scfg.max_quote_age_secs:
+                self._bump("stale_quote")
                 continue
-            sig = strategy.check_entry(market, self.histories[market.key], gs, scfg)
+            if quote.home_spread > scfg.max_spread:
+                self._bump("wide_spread")
+                continue
+            sig = strategy.check_entry(market, self.histories[market.key], gs, scfg,
+                                       funnel=self.funnel)
             if sig is None:
                 continue
             for strat in self.strategies:
                 if time.time() < self.cooldowns.get((strat, market.key), 0):
+                    self._bump("cooldown")
                     continue
                 if sig.token in self.broker.positions[strat]:
+                    self._bump("already_open")
                     continue
                 stake = self._stake_for_signal(sig, quote)
                 if not self.risk.can_open(self.broker, strat, market.key, stake):
+                    self._bump("risk_blocked")
                     continue
                 reason = f"{sig.reason}; spread {quote.home_spread:.3f}; stake ${stake:.0f}"
                 if strat == AI:
                     verdict = self.judge.judge(sig, gs)
                     if not verdict.approve:
+                        self._bump("ai_rejected")
                         self._event("[ai] rejected %s: %s", sig.side_team, verdict.reason)
                         self.cooldowns[(AI, market.key)] = time.time() + scfg.cooldown_secs
                         continue
@@ -200,6 +242,7 @@ class Engine:
                 pos = self.broker.open(strat, market.key, sig.token, sig.side_team,
                                        sig.price, stake)
                 if pos:
+                    self._bump("opened")
                     self._event("[%s] OPEN %s @ %.3f - %s",
                                 strat, sig.side_team, pos.entry_price, reason)
                     self.journal.record_open(strat, market.key, sig.side_team,
@@ -245,9 +288,10 @@ class Engine:
                 f"{strat}: equity=${eq:.2f}, cash=${self.broker.cash[strat]:.2f}, "
                 f"open={len(self.broker.open_positions(strat))}"
             )
+        funnel = " ".join(f"{k}={v}" for k, v in sorted(self.funnel.items())) or "none"
         log.info(
-            "status: tracked=%d live=%d recent_bbo=%d %s",
-            len(self.markets), live_games, recent_quotes, "; ".join(parts),
+            "status: tracked=%d live=%d recent_bbo=%d %s | entry funnel: %s",
+            len(self.markets), live_games, recent_quotes, "; ".join(parts), funnel,
         )
 
     def _event(self, message: str, *args):

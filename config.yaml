@@ -5,6 +5,9 @@ strategy:
   move_lookback_secs: 90      # window for detecting a sharp move
   move_threshold: 0.08        # min |price change| over the window (8 cents)
   min_edge: 0.05              # model must disagree with the move by >= this
+  home_fair_shrink: 0.05      # bias fix: model overrates home teams ~5-9 pts in
+                              # mid-range (backtest calibrate); replay P&L best here
+  max_quote_age_secs: 30      # no entries on a BBO staler than this
   early_game_max_inning: 5    # early innings are noisier; trade only strong setups
   early_game_min_edge: 0.10
   early_game_min_fair_extreme: 0.70

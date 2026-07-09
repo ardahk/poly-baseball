@@ -1,3 +1,4 @@
+import pytest
 import time
 
 from polybot.config import StrategyConfig
@@ -124,3 +125,27 @@ def test_exit_edge_gone():
 def test_hold_otherwise():
     cfg = StrategyConfig()
     assert check_exit(pos(0.50), 0.52, 0.55, False, cfg) is None
+
+
+def test_funnel_counts_reject_reasons():
+    funnel = {}
+    h = playful_history([0.60, 0.40, 0.60, 0.60, 0.40])
+    # model agrees with the move -> rejected at the edge gate
+    gs = live_gs(inning=7, is_top=True, home_score=1, away_score=4)
+    assert check_entry(make_market(), h, gs, CFG, funnel=funnel) is None
+    assert funnel == {"no_edge": 1}
+    # a passing setup increments "signal"
+    gs = live_gs(inning=7, is_top=True, home_score=4, away_score=1)
+    assert check_entry(make_market(), h, gs, CFG, funnel=funnel) is not None
+    assert funnel["signal"] == 1
+
+
+def test_home_fair_shrink_lowers_home_fair():
+    import dataclasses
+    h = playful_history([0.60, 0.40, 0.60, 0.60, 0.40])
+    gs = live_gs(inning=7, is_top=True, home_score=4, away_score=1)
+    base = check_entry(make_market(), h, gs, CFG)
+    shrunk_cfg = dataclasses.replace(CFG, home_fair_shrink=0.05)
+    shrunk = check_entry(make_market(), h, gs, shrunk_cfg)
+    assert base is not None and shrunk is not None
+    assert shrunk.fair == pytest.approx(base.fair - 0.05)

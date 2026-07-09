@@ -19,6 +19,8 @@ class StrategyConfig:
     move_lookback_secs: float = 90.0     # window for "sharp move" detection
     move_threshold: float = 0.08         # min |price change| over lookback
     min_edge: float = 0.05               # min model-vs-market divergence
+    home_fair_shrink: float = 0.0        # subtract from model P(home) (bias correction)
+    max_quote_age_secs: float = 30.0     # no entries on a BBO staler than this
     early_game_max_inning: int = 5       # through this inning, require a stronger setup
     early_game_min_edge: float = 0.10    # early trades need more edge
     early_game_min_fair_extreme: float = 0.70  # early fair must be >= this or <= 1-this

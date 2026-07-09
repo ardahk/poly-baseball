@@ -7,7 +7,7 @@ import time
 from collections import deque
 from typing import Any
 
-from .winprob import home_win_probability
+from .strategy import fair_home_value
 
 
 class TerminalDashboard:
@@ -72,6 +72,7 @@ class TerminalDashboard:
             f"{time.strftime('%H:%M:%S')}",
             "=" * width,
             self._poll_line(engine, now),
+            self._funnel_line(engine),
             "",
             "STRATEGIES",
         ]
@@ -146,6 +147,17 @@ class TerminalDashboard:
             f"game-state {_duration(game_due)} | status-log {_duration(status_due)}"
         )
 
+    def _funnel_line(self, engine: Any) -> str:
+        funnel = getattr(engine, "funnel", None) or {}
+        if not funnel:
+            return "entry funnel: no live candidates yet"
+        order = ["not_playful", "small_move", "no_edge", "price_band", "early_game",
+                 "stale_quote", "wide_spread", "cooldown", "already_open",
+                 "risk_blocked", "ai_rejected", "signal", "opened"]
+        parts = [f"{k} {funnel[k]}" for k in order if funnel.get(k)]
+        parts += [f"{k} {v}" for k, v in sorted(funnel.items()) if k not in order]
+        return "entry funnel: " + " | ".join(parts)
+
     def _market_rows(self, engine: Any, now: float) -> list[list[str]]:
         rows = []
         for market in engine.markets.values():
@@ -159,7 +171,7 @@ class TerminalDashboard:
                 if gs.is_live:
                     half = "T" if gs.is_top else "B"
                     state = f"{half}{gs.inning}/{gs.outs}o"
-                    fair = _prob(home_win_probability(gs))
+                    fair = _prob(fair_home_value(gs, engine.cfg.strategy))
             history = engine.histories.get(market.key)
             move = history.move(engine.cfg.strategy.move_lookback_secs) if history else None
             rows.append([

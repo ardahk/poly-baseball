@@ -61,3 +61,22 @@ def test_quote_normalizes_short_home_side():
     assert quote.home_ask == pytest.approx(0.45)
     assert quote.home_mid == pytest.approx(0.43)
     assert quote.home_spread == pytest.approx(0.04)
+
+
+def test_parse_book_quote_two_sided_and_one_sided():
+    two_sided = pmus._parse_book_quote({
+        "bestBidQuote": {"value": "0.5150"},
+        "bestAskQuote": {"value": "0.5200"},
+        "marketSides": [{"long": True, "price": "0.5150"}, {"long": False}],
+    })
+    assert two_sided.two_sided
+    assert two_sided.long_bid == pytest.approx(0.515)
+    assert two_sided.long_ask == pytest.approx(0.52)
+
+    one_sided = pmus._parse_book_quote({
+        "bestAskQuote": {"value": "0.0050"},
+        "marketSides": [{"long": True, "price": "0.0050"}, {"long": False}],
+    })
+    assert not one_sided.two_sided
+    assert one_sided.long_bid is None
+    assert one_sided.long_last == pytest.approx(0.005)
