@@ -144,6 +144,36 @@ CREATE TABLE IF NOT EXISTS runs (
     config_hash TEXT NOT NULL,
     code_revision TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    run_id TEXT,
+    strategy TEXT NOT NULL,
+    market TEXT NOT NULL,
+    token TEXT NOT NULL,
+    side_team TEXT,
+    entry_price REAL,
+    fair REAL,
+    edge REAL,
+    move REAL,
+    spread REAL,
+    inning INTEGER,
+    is_top INTEGER,
+    home_score INTEGER,
+    away_score INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_signals_market_ts ON signals (market, ts);
+CREATE TABLE IF NOT EXISTS signal_counterfactuals (
+    signal_id INTEGER NOT NULL,
+    horizon_secs INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    exec_bid REAL,
+    exec_ask REAL,
+    mid REAL,
+    two_sided INTEGER,
+    spread REAL,
+    PRIMARY KEY (signal_id, horizon_secs)
+);
 """
 
 _TRADE_V2_COLUMNS = {
@@ -297,6 +327,33 @@ class Journal:
                 fair, edge, move, spread, intended_price, slippage, exit_kind,
                 pnl_usd, pnl_pct, reason, self.active_run_id, fee_usd,
             ),
+        )
+        if commit:
+            self.conn.commit()
+
+    def record_signal(self, *, strategy, market, token, side_team, entry_price,
+                      fair, edge, move, spread, inning, is_top, home_score,
+                      away_score, ts=None, commit=True) -> int:
+        cur = self.conn.execute(
+            """INSERT INTO signals (ts, run_id, strategy, market, token, side_team,
+               entry_price, fair, edge, move, spread, inning, is_top,
+               home_score, away_score) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (time.time() if ts is None else ts, self.active_run_id, strategy, market,
+             token, side_team, entry_price, fair, edge, move, spread, inning, is_top,
+             home_score, away_score),
+        )
+        if commit:
+            self.conn.commit()
+        return int(cur.lastrowid)
+
+    def record_counterfactual(self, signal_id, horizon_secs, *, exec_bid, exec_ask,
+                              mid, two_sided, spread, ts=None, commit=True):
+        self.conn.execute(
+            """INSERT OR IGNORE INTO signal_counterfactuals
+               (signal_id, horizon_secs, ts, exec_bid, exec_ask, mid, two_sided, spread)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (signal_id, horizon_secs, time.time() if ts is None else ts,
+             exec_bid, exec_ask, mid, two_sided, spread),
         )
         if commit:
             self.conn.commit()

@@ -134,3 +134,24 @@ def test_record_and_query_round_trips_decisions_states_and_markets(tmp_path):
         assert journal.markets_between(0, 2000)[0].slug == "m1"
     finally:
         journal.close()
+
+
+def test_records_signal_and_counterfactuals(tmp_path):
+    j = Journal(str(tmp_path / "j.db"))
+    j.start_run("paper", "hash")
+    sid = j.record_signal(strategy="fade_v1_frozen", market="m1", token="m1:LONG",
+                          side_team="Homers", entry_price=0.41, fair=0.55, edge=0.14,
+                          move=-0.10, spread=0.02, inning=7, is_top=1,
+                          home_score=4, away_score=1)
+    assert isinstance(sid, int)
+    j.record_counterfactual(sid, horizon_secs=30, exec_bid=0.44, exec_ask=0.46,
+                            mid=0.45, two_sided=1, spread=0.02)
+    rows = j.conn.execute(
+        "SELECT * FROM signal_counterfactuals WHERE signal_id=?", (sid,)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["horizon_secs"] == 30
+    assert rows[0]["exec_ask"] == 0.46
+    sig = j.conn.execute("SELECT * FROM signals WHERE id=?", (sid,)).fetchone()
+    assert sig["strategy"] == "fade_v1_frozen"
+    assert sig["run_id"] is not None
+    j.close()
