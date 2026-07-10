@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from decimal import Decimal, ROUND_HALF_EVEN
 
 from .models import Position
 
@@ -25,26 +26,37 @@ class PaperBroker:
     math and AI ledgers can be compared cleanly.
     """
 
-    def __init__(self, strategies: list[str], starting_cash: float, slippage: float = 0.005):
+    def __init__(self, strategies: list[str], starting_cash: float, slippage: float = 0.0,
+                 taker_fee_theta: float = 0.0):
         self.slippage = slippage
+        self.taker_fee_theta = taker_fee_theta
         self.cash: dict[str, float] = {s: starting_cash for s in strategies}
         self.positions: dict[str, dict[str, Position]] = {s: {} for s in strategies}
         self.realized: dict[str, float] = {s: 0.0 for s in strategies}
         self.closes: dict[str, int] = {s: 0 for s in strategies}
+        self.last_fee: dict[str, float] = {s: 0.0 for s in strategies}
+
+    def fee(self, price: float, qty: float) -> float:
+        """Exchange taker fee, rounded like the venue (banker's rounding)."""
+        raw = Decimal(str(self.taker_fee_theta)) * Decimal(str(qty)) \
+            * Decimal(str(price)) * (Decimal("1") - Decimal(str(price)))
+        return float(raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN))
 
     def open(self, strategy: str, market_key: str, token: str, team: str,
              price: float, stake_usd: float) -> Position | None:
         fill = min(price + self.slippage, 0.999)
         qty = stake_usd / fill
-        cost = qty * fill
+        fee = self.fee(fill, qty)
+        cost = qty * fill + fee
         if cost > self.cash[strategy]:
             log.info("[%s] insufficient cash for %s", strategy, team)
             return None
         if token in self.positions[strategy]:
             return None  # already holding this token
         self.cash[strategy] -= cost
+        self.last_fee[strategy] = fee
         pos = Position(strategy=strategy, market_key=market_key, token=token,
-                       team=team, qty=qty, entry_price=fill,
+                       team=team, qty=qty, entry_price=fill, entry_fee=fee,
                        trade_id=uuid.uuid4().hex[:12])
         self.positions[strategy][token] = pos
         return pos
@@ -55,11 +67,13 @@ class PaperBroker:
         if pos is None:
             return None
         fill = max(price - self.slippage, 0.001)
-        proceeds = pos.qty * fill
+        fee = self.fee(fill, pos.qty)
+        proceeds = pos.qty * fill - fee
         self.cash[strategy] += proceeds
         pnl = proceeds - pos.cost
         self.realized[strategy] += pnl
         self.closes[strategy] += 1
+        self.last_fee[strategy] = fee
         return pos, fill, pnl
 
     def settle(self, strategy: str, token: str, settlement_price: float) -> tuple[Position, float, float] | None:
@@ -73,6 +87,7 @@ class PaperBroker:
         pnl = proceeds - pos.cost
         self.realized[strategy] += pnl
         self.closes[strategy] += 1
+        self.last_fee[strategy] = 0.0
         return pos, fill, pnl
 
     def equity(self, strategy: str, prices: dict[str, float]) -> float:

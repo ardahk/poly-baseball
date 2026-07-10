@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, datetime, timedelta
 
 import requests
@@ -62,13 +63,14 @@ class MLBClient:
             )
             resp.raise_for_status()
             data = resp.json()
+            received_at = time.time()
         except Exception as exc:
             log.debug("MLB live feed failed for %s: %s", game_pk, exc)
             return None
-        return _parse_live_feed(game_pk, data)
+        return _parse_live_feed(game_pk, data, received_at=received_at)
 
 
-def _parse_live_feed(game_pk: int, data: dict) -> GameState:
+def _parse_live_feed(game_pk: int, data: dict, received_at: float | None = None) -> GameState:
     live = data.get("liveData", {})
     line = live.get("linescore", {})
     status = data.get("gameData", {}).get("status", {}).get("abstractGameState", "Scheduled")
@@ -84,6 +86,7 @@ def _parse_live_feed(game_pk: int, data: dict) -> GameState:
         on_second="second" in offense,
         on_third="third" in offense,
         status=status,
+        received_at=time.time() if received_at is None else received_at,
     )
 
 

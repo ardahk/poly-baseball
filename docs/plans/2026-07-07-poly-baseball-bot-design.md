@@ -68,9 +68,10 @@ Polymarket US sports gateway        MLB Stats API (free, live game state)
 - **AI judge** (`ai_judge.py`): Claude (default `claude-opus-4-8`, adaptive
   thinking, low effort, structured JSON output) approves/rejects each math
   signal for the "ai" ledger. Fails closed (reject) on API errors.
-- **Brokers** (`broker.py`): `PaperBroker` (default; fills at mid ± slippage,
-  per-strategy cash/positions) and `LiveBroker` (requires the official
-  `polymarket-us` SDK plus Polymarket US API key id/secret; guarded).
+- **Brokers** (`broker.py`): `PaperBroker` (default; fills at executable BBO
+  side plus the configured taker fee, per-strategy cash/positions). Live
+  execution is intentionally disabled during Phase 0 pending reconciliation
+  and promotion-gate work.
 - **Risk** (`risk.py`): max concurrent positions, max stake per market,
   adaptive $5/$10 sizing, spread checks, daily loss kill switch, and longer
   same-market lockout after stop loss — all per strategy.

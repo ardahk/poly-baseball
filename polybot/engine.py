@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import logging
 import time
+import hashlib
+import json
+import os
 from collections import deque
+from dataclasses import asdict
 
 from . import mlb, pmus, strategy
 from .ai_judge import AIJudge
-from .broker import LiveBroker, PaperBroker
+from .broker import PaperBroker
 from .config import Config
 from .dashboard import TerminalDashboard
 from .journal import Journal
@@ -23,6 +27,8 @@ AI = "ai"
 
 class Engine:
     def __init__(self, cfg: Config, dashboard: bool = False):
+        if cfg.engine.live:
+            raise RuntimeError("Live trading is disabled during Phase 0 validation")
         self.cfg = cfg
         self.judge = AIJudge(cfg.ai)
         self.strategies = [MATH] + ([AI] if self.judge.available else [])
@@ -33,13 +39,19 @@ class Engine:
         self.dashboard = TerminalDashboard(enabled=dashboard)
         self.events: deque[str] = deque(maxlen=10)
 
-        broker_cls = LiveBroker if cfg.engine.live else PaperBroker
-        self.broker = broker_cls(self.strategies, cfg.risk.starting_cash,
-                                 cfg.engine.slippage)
+        self.broker = PaperBroker(
+            self.strategies, cfg.risk.starting_cash, slippage=0.0,
+            taker_fee_theta=cfg.engine.paper_taker_fee_theta,
+        )
         self.journal = Journal(cfg.engine.db_path)
-        if not cfg.engine.live:
-            self._restore_paper_account()
-            self.journal.save_paper_state(self.broker)
+        config_hash = hashlib.sha256(
+            json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.run_id = self.journal.start_run(
+            "paper", config_hash, os.environ.get("POLYBOT_CODE_REVISION", "unknown")
+        )
+        self._restore_paper_account()
+        self.journal.save_paper_state(self.broker)
         self.session_realized = dict(self.broker.realized)
         self.risk = RiskManager(cfg.risk, self.strategies)
         self.mlb = mlb.MLBClient()
@@ -63,6 +75,7 @@ class Engine:
             Position(
                 strategy=row["strategy"], market_key=row["market"], token=row["token"],
                 team=row["team"], qty=row["qty"], entry_price=row["entry_price"],
+                entry_fee=row["entry_fee"],
                 opened_at=row["opened_at"], trade_id=row["trade_id"],
             )
             for row in saved_positions
@@ -73,8 +86,7 @@ class Engine:
                         "s" if restored_positions != 1 else "")
 
     def _save_paper_account(self) -> None:
-        if not self.cfg.engine.live:
-            self.journal.save_paper_state(self.broker)
+        self.journal.save_paper_state(self.broker)
 
     # ------------------------------------------------------------------ loop
 
@@ -142,6 +154,39 @@ class Engine:
                 self.game_states[market.game_pk] = gs
                 if gs != previous:
                     self.journal.record_game_state(gs)
+                if gs.is_final and not (previous and previous.is_final):
+                    self._settle_final_game(gs)
+
+    def _settle_final_game(self, gs: GameState) -> None:
+        """Paper contracts resolve at the official final outcome, never a stale BBO."""
+        if gs.home_score == gs.away_score:
+            self._event("final game %s is tied; awaiting official resolution", gs.game_pk)
+            return
+        with self.journal.conn:
+            for market in self.markets.values():
+                if market.game_pk != gs.game_pk:
+                    continue
+                for strat in self.strategies:
+                    for pos in list(self.broker.open_positions(strat)):
+                        if pos.market_key != market.key:
+                            continue
+                        home_won = gs.home_score > gs.away_score
+                        won = (pos.token == market.home_token and home_won) or (
+                            pos.token == market.away_token and not home_won
+                        )
+                        result = self.broker.settle(strat, pos.token, 1.0 if won else 0.0)
+                        if result is None:
+                            continue
+                        position, fill, pnl = result
+                        self.journal.record_close(
+                            strat, position.market_key, position.team, position.token,
+                            position.qty, fill, pnl, position.pnl_pct(fill),
+                            "official game settlement", trade_id=position.trade_id,
+                            intended_price=fill, slippage=0.0, exit_kind="game_final",
+                            fee_usd=0.0, commit=False,
+                        )
+                        self._event("[%s] SETTLE %s @ %.3f ($%+.2f)", strat, position.team, fill, pnl)
+            self.journal.save_paper_state(self.broker, commit=False)
 
     def _should_poll_game_state(self, market: Market, now: float) -> bool:
         current = self.game_states.get(market.game_pk)
@@ -166,6 +211,10 @@ class Engine:
                 self.journal.record_price(market, quote)
                 self.latest_quotes[market.key] = quote
                 home_mid = quote.home_mid
+                # Long positions liquidate at their bid; short positions at
+                # the synthetic short bid (1 - long ask), not midpoint.
+                self.latest_prices[market.home_token] = quote.home_bid
+                self.latest_prices[market.away_token] = 1.0 - quote.home_ask
             elif book.long_last is not None:
                 # One-sided book (common mid-play): keep the price history
                 # alive from the mark price so move detection doesn't freeze,
@@ -173,11 +222,13 @@ class Engine:
                 home_mid = book.long_last if market.home_is_long \
                     else 1.0 - book.long_last
                 self.journal.record_mark(market, home_mid, book.long_last)
+                # A mark is useful for observability only. It must never be
+                # paired with a previous BBO to create an executable order.
+                self.latest_quotes.pop(market.key, None)
             else:
+                self.latest_quotes.pop(market.key, None)
                 continue
             self.histories[market.key].add(home_mid)
-            self.latest_prices[market.home_token] = home_mid
-            self.latest_prices[market.away_token] = 1.0 - home_mid
 
     @staticmethod
     def _to_home_quote(market: Market, book: pmus.BookQuote) -> MarketQuote:
@@ -189,7 +240,8 @@ class Engine:
             market_key=market.key,
             home_bid=home_bid, home_ask=home_ask,
             long_bid=book.long_bid, long_ask=book.long_ask,
-            ts=time.time(),
+            ts=book.received_at,
+            source_ts=book.source_ts,
         )
 
     # ----------------------------------------------------------------- exits
@@ -200,6 +252,9 @@ class Engine:
                 market = self.markets.get(pos.market_key)
                 price = self.latest_prices.get(pos.token)
                 if market is None or price is None:
+                    continue
+                quote = self.latest_quotes.get(market.key)
+                if quote is None or time.time() - quote.ts > self.cfg.strategy.max_quote_age_secs:
                     continue
                 gs = self.game_states.get(market.game_pk)
                 fair = None
@@ -221,12 +276,14 @@ class Engine:
         pnl_pct = position.pnl_pct(fill)
         self._event("[%s] CLOSE %s @ %.3f (%+.1f%%, $%+.2f) - %s",
                     strat, position.team, fill, pnl_pct * 100, pnl, reason)
-        self.journal.record_close(strat, position.market_key, position.team,
-                                  position.token, position.qty, fill, pnl, pnl_pct, reason,
-                                  trade_id=position.trade_id, fair=fair,
-                                  intended_price=price, slippage=fill - price,
-                                  exit_kind=strategy.exit_kind(reason))
-        self._save_paper_account()
+        with self.journal.conn:
+            self.journal.record_close(strat, position.market_key, position.team,
+                                      position.token, position.qty, fill, pnl, pnl_pct, reason,
+                                      trade_id=position.trade_id, fair=fair,
+                                      intended_price=price, slippage=fill - price,
+                                      exit_kind=strategy.exit_kind(reason),
+                                      fee_usd=self.broker.last_fee[strat], commit=False)
+            self.journal.save_paper_state(self.broker, commit=False)
         cooldown = self.cfg.strategy.stop_loss_cooldown_secs \
             if reason.startswith("stop loss") else self.cfg.strategy.cooldown_secs
         self.cooldowns[(strat, position.market_key)] = time.time() + cooldown
@@ -307,6 +364,15 @@ class Engine:
             sig = ev.signal
             if sig is None:
                 continue
+            entry_price = self._entry_price(market, quote, sig.token)
+            executable_edge = sig.fair - entry_price
+            if executable_edge < scfg.min_edge:
+                self._bump("execution_cost")
+                rows.append(self._decision_row(
+                    market, gs, "execution", "execution_cost", ev=ev, quote=quote,
+                    quote_age=now - quote.ts, margin=executable_edge - scfg.min_edge, ts=now,
+                ))
+                continue
             for strat in self.strategies:
                 if time.time() < self.cooldowns.get((strat, market.key), 0):
                     self._bump("cooldown")
@@ -324,7 +390,7 @@ class Engine:
                         quote_age=now - quote.ts, ts=now,
                     ))
                     continue
-                stake = self._stake_for_signal(sig, quote)
+                stake = self._stake_for_signal(sig, quote, edge=executable_edge)
                 daily_realized = self.journal.realized_pnl(strat, day_start, day_end)
                 if not self.risk.can_open(
                     self.broker, strat, market.key, stake, daily_realized=daily_realized,
@@ -352,7 +418,7 @@ class Engine:
                         continue
                     reason += f" | ai: {verdict.reason} ({verdict.confidence:.2f})"
                 pos = self.broker.open(strat, market.key, sig.token, sig.side_team,
-                                       sig.price, stake)
+                                       entry_price, stake)
                 if pos:
                     self._bump("opened")
                     rows.append(self._decision_row(
@@ -362,14 +428,16 @@ class Engine:
                     ))
                     self._event("[%s] OPEN %s @ %.3f - %s",
                                 strat, sig.side_team, pos.entry_price, reason)
-                    self.journal.record_open(strat, market.key, sig.side_team,
-                                             sig.token, pos.qty, pos.entry_price, reason,
-                                             trade_id=pos.trade_id, fair=sig.fair,
-                                             edge=sig.edge, move=sig.move,
-                                             spread=quote.home_spread,
-                                             intended_price=sig.price,
-                                             slippage=pos.entry_price - sig.price)
-                    self._save_paper_account()
+                    with self.journal.conn:
+                        self.journal.record_open(strat, market.key, sig.side_team,
+                                                 sig.token, pos.qty, pos.entry_price, reason,
+                                                 trade_id=pos.trade_id, fair=sig.fair,
+                                                 edge=executable_edge, move=sig.move,
+                                                 spread=quote.home_spread,
+                                                 intended_price=entry_price,
+                                                 slippage=pos.entry_price - entry_price,
+                                                 fee_usd=self.broker.last_fee[strat], commit=False)
+                        self.journal.save_paper_state(self.broker, commit=False)
                 else:
                     rows.append(self._decision_row(
                         market, gs, "post_signal", "open_failed",
@@ -378,10 +446,20 @@ class Engine:
                     ))
         self.journal.record_decisions(rows)
 
-    def _stake_for_signal(self, sig, quote: MarketQuote) -> float:
+    @staticmethod
+    def _entry_price(market: Market, quote: MarketQuote, token: str) -> float:
+        """Executable taker buy price for a normalized token side."""
+        if token == market.home_token:
+            return quote.home_ask
+        if token == market.away_token:
+            return 1.0 - quote.home_bid
+        raise ValueError(f"token {token!r} does not belong to market {market.key!r}")
+
+    def _stake_for_signal(self, sig, quote: MarketQuote, edge: float | None = None) -> float:
         rcfg = self.cfg.risk
         scfg = self.cfg.strategy
-        if sig.edge >= rcfg.strong_stake_min_edge \
+        executable_edge = sig.edge if edge is None else edge
+        if executable_edge >= rcfg.strong_stake_min_edge \
                 and quote.home_spread <= scfg.strong_stake_max_spread:
             return rcfg.strong_stake_usd
         return rcfg.stake_usd

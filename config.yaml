@@ -49,6 +49,7 @@ engine:
   discovery_interval_secs: 1800
   equity_snapshot_secs: 60
   status_log_interval_secs: 300
-  slippage: 0.005
+  slippage: 0.0                 # runtime fills use executable BBO; legacy replay only
+  paper_taker_fee_theta: 0.06   # Polymarket US taker fee coefficient
   report_timezone: America/Los_Angeles # trading-day boundary, not the host timezone
   db_path: polybot.db

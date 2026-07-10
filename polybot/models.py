@@ -51,7 +51,10 @@ class MarketQuote:
     home_ask: float
     long_bid: float
     long_ask: float
+    # Receipt time is the decision-time clock. `source_ts` is optional because
+    # the bulk gateway payload does not always expose an exchange timestamp.
     ts: float = field(default_factory=time.time)
+    source_ts: float | None = None
 
     @property
     def home_mid(self) -> float:
@@ -75,6 +78,7 @@ class GameState:
     on_second: bool = False
     on_third: bool = False
     status: str = "Scheduled"    # Scheduled | Live | Final
+    received_at: float = field(default_factory=time.time, compare=False)
 
     @property
     def is_live(self) -> bool:
@@ -125,12 +129,13 @@ class Position:
     team: str
     qty: float
     entry_price: float
+    entry_fee: float = 0.0
     opened_at: float = field(default_factory=time.time)
     trade_id: str = ""
 
     @property
     def cost(self) -> float:
-        return self.qty * self.entry_price
+        return self.qty * self.entry_price + self.entry_fee
 
     def pnl_pct(self, price: float) -> float:
         return (price - self.entry_price) / self.entry_price

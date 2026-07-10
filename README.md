@@ -25,8 +25,8 @@ Keys (all optional to start):
 | Key | Needed for |
 |---|---|
 | `ANTHROPIC_API_KEY` | the "ai" strategy (bot runs math-only without it) |
-| `POLYMARKET_KEY_ID` | `run --live` only |
-| `POLYMARKET_SECRET_KEY` | `run --live` only; paste without surrounding quotes |
+| `POLYMARKET_KEY_ID` | Reserved for the later live-execution phase |
+| `POLYMARKET_SECRET_KEY` | Reserved for the later live-execution phase |
 
 ## Usage
 
@@ -36,8 +36,7 @@ python main.py run           # paper trade (default, no keys needed)
 python main.py run --dashboard # paper trade with a live terminal dashboard
 python main.py report        # math-vs-AI performance comparison
 python main.py review        # end-of-day trade/funnel/near-miss review
-python main.py run --live    # real orders — requires pip install polymarket-us + keys
-python main.py run --live --yes-live  # real orders without prompt for systemd
+python main.py run --live    # intentionally disabled during Phase 0
 
 python main.py backtest calibrate --days 7   # is the win-prob formula accurate?
 python main.py backtest strategy  --days 1   # would the trading logic have profited?
@@ -55,11 +54,20 @@ Use `run --dashboard` during a game for a live terminal view of tracked games,
 fresh BBO counts, strategy equity, market state, open positions, and recent
 engine events.
 
+Phase 0 intentionally disables live orders. Paper results must clear the
+execution-realism and reconciliation promotion gates before live trading is
+reintroduced.
+
 Paper-account cash, positions, and realized P&L persist in `polybot.db` across
 restarts. The dashboard labels its session P&L separately from the persisted
 ledger, and the daily-loss limit uses the configured trading-day boundary
 (`engine.report_timezone`, default `America/Los_Angeles`). Use
 `review --timezone UTC` only when you deliberately want UTC calendar days.
+
+Runtime paper fills use the executable BBO side (buy at ask, sell at bid) and
+the configured Polymarket US taker-fee coefficient. One-sided marks are recorded
+for research but cannot trigger an entry or exit. New events are linked to an
+immutable run ID plus configuration hash in the journal.
 
 The first command that opens an older `polybot.db` migrates it in place. The
 migration is additive, but copy the DB aside first if it contains data you care
@@ -69,10 +77,6 @@ about:
 cp polybot.db "polybot.db.backup-$(date +%Y%m%d)"
 python main.py status
 ```
-
-For unattended live mode, either use `--yes-live` in the service command or set
-`POLYBOT_CONFIRM_LIVE=yes` in `.env`. Manual `--live` runs still prompt by
-default.
 
 ## Tuning
 

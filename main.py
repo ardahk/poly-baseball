@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from datetime import datetime
 
@@ -33,14 +32,10 @@ from polybot.winprob import home_win_probability
 
 def cmd_run(args, cfg):
     if args.live:
-        cfg.engine.live = True
-        confirmed = args.yes_live or os.environ.get("POLYBOT_CONFIRM_LIVE", "").lower() == "yes"
-        if not confirmed:
-            confirm = input("LIVE trading with real funds. Type 'yes' to continue: ")
-            confirmed = confirm.strip().lower() == "yes"
-        if not confirmed:
-            print("aborted")
-            return
+        raise SystemExit(
+            "Live trading is disabled during Phase 0. Paper results and exchange reconciliation "
+            "must pass the promotion gate before real orders can be enabled."
+        )
     Engine(cfg, dashboard=args.dashboard).run()
 
 
@@ -162,7 +157,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
     p_run = sub.add_parser("run", help="start the trading loop")
-    p_run.add_argument("--live", action="store_true", help="submit real orders")
+    p_run.add_argument("--live", action="store_true", help="disabled during Phase 0")
     p_run.add_argument(
         "--dashboard",
         action="store_true",

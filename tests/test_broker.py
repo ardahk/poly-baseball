@@ -33,6 +33,19 @@ def test_slippage_applied():
     assert fill == pytest.approx(0.49)
 
 
+def test_taker_fees_are_debited_from_entry_and_exit():
+    b = PaperBroker(["math"], 100.0, slippage=0.0, taker_fee_theta=0.06)
+
+    pos = b.open("math", "m1", "tok1", "T", 0.50, 10.0)
+    assert pos is not None
+    assert pos.entry_fee == pytest.approx(0.30)
+    assert b.cash["math"] == pytest.approx(89.70)
+    _, _, pnl = b.close("math", "tok1", 0.60)
+    assert b.last_fee["math"] == pytest.approx(0.29)
+    assert pnl == pytest.approx(1.41)
+    assert b.cash["math"] == pytest.approx(101.41)
+
+
 def test_ledgers_are_independent(broker):
     broker.open("math", "m1", "tok1", "T", 0.50, 10.0)
     assert broker.cash["math"] == pytest.approx(90.0)

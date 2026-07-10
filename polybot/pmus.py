@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import requests
@@ -44,6 +44,8 @@ class BookQuote:
     long_bid: float | None
     long_ask: float | None
     long_last: float | None   # last/mark price fallback when the book is one-sided
+    received_at: float = field(default_factory=time.time)
+    source_ts: float | None = None
 
     @property
     def two_sided(self) -> bool:
@@ -71,6 +73,7 @@ def fetch_mlb_book(
         )
         resp.raise_for_status()
         data = resp.json()
+        received_at = time.time()
     except Exception as exc:
         log.warning("Polymarket US discovery failed: %s", exc)
         return markets, quotes
@@ -82,7 +85,7 @@ def fetch_mlb_book(
             market = _parse_market(m, include_closed=include_closed)
             if market:
                 markets.append(market)
-                quotes[market.slug] = _parse_book_quote(m)
+                quotes[market.slug] = _parse_book_quote(m, received_at=received_at)
     log.debug("Polymarket US: %d MLB moneyline markets discovered", len(markets))
     return markets, quotes
 
@@ -104,7 +107,7 @@ def _quote_value(raw) -> float | None:
     return _price(raw.get("value"))
 
 
-def _parse_book_quote(m: dict) -> BookQuote:
+def _parse_book_quote(m: dict, received_at: float | None = None) -> BookQuote:
     long_last = None
     for side in m.get("marketSides") or []:
         if side.get("long"):
@@ -113,6 +116,8 @@ def _parse_book_quote(m: dict) -> BookQuote:
         long_bid=_quote_value(m.get("bestBidQuote")),
         long_ask=_quote_value(m.get("bestAskQuote")),
         long_last=long_last,
+        received_at=time.time() if received_at is None else received_at,
+        source_ts=_parse_iso(m.get("transactTime") or m.get("updatedAt")),
     )
 
 

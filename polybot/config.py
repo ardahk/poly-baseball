@@ -70,7 +70,8 @@ class EngineConfig:
     discovery_interval_secs: float = 1800.0
     equity_snapshot_secs: float = 60.0
     status_log_interval_secs: float = 300.0
-    slippage: float = 0.005              # paper fill: mid +/- this
+    slippage: float = 0.0                # legacy backtest-only additive fill adjustment
+    paper_taker_fee_theta: float = 0.06  # Polymarket US fee coefficient, effective 2026-07
     report_timezone: str = "America/Los_Angeles"  # trading-day/report boundary
     live: bool = False
     db_path: str = "polybot.db"

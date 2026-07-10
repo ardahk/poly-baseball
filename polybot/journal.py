@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 
 from .models import GameState, Market
 
@@ -19,7 +20,10 @@ CREATE TABLE IF NOT EXISTS price_ticks (
     long_bid REAL,
     long_ask REAL,
     two_sided INTEGER NOT NULL DEFAULT 1,
-    source TEXT NOT NULL DEFAULT 'bbo'
+    source TEXT NOT NULL DEFAULT 'bbo',
+    run_id TEXT,
+    received_at REAL,
+    source_ts REAL
 );
 """
 
@@ -44,14 +48,17 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_kind TEXT,
     pnl_usd REAL,                  -- CLOSE only
     pnl_pct REAL,                  -- CLOSE only
-    reason TEXT
+    reason TEXT,
+    run_id TEXT,
+    fee_usd REAL
 );
 CREATE TABLE IF NOT EXISTS equity (
     ts REAL NOT NULL,
     strategy TEXT NOT NULL,
     equity REAL NOT NULL,
     cash REAL NOT NULL,
-    open_positions INTEGER NOT NULL
+    open_positions INTEGER NOT NULL,
+    run_id TEXT
 );
 {_PRICE_TICKS_DDL}
 CREATE INDEX IF NOT EXISTS idx_price_ticks_market_ts
@@ -77,7 +84,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     inning INTEGER,
     is_top INTEGER,
     home_score INTEGER,
-    away_score INTEGER
+    away_score INTEGER,
+    run_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_market_ts
     ON decisions (market, ts);
@@ -94,7 +102,9 @@ CREATE TABLE IF NOT EXISTS game_states (
     on_first INTEGER NOT NULL,
     on_second INTEGER NOT NULL,
     on_third INTEGER NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    run_id TEXT,
+    received_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_game_states_game_ts
     ON game_states (game_pk, ts);
@@ -122,9 +132,17 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     team TEXT NOT NULL,
     qty REAL NOT NULL,
     entry_price REAL NOT NULL,
+    entry_fee REAL NOT NULL DEFAULT 0,
     opened_at REAL NOT NULL,
     trade_id TEXT NOT NULL,
     PRIMARY KEY (strategy, token)
+);
+CREATE TABLE IF NOT EXISTS runs (
+    id TEXT PRIMARY KEY,
+    started_at REAL NOT NULL,
+    mode TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    code_revision TEXT NOT NULL
 );
 """
 
@@ -137,12 +155,22 @@ _TRADE_V2_COLUMNS = {
     "intended_price": "REAL",
     "slippage": "REAL",
     "exit_kind": "TEXT",
+    "run_id": "TEXT",
+    "fee_usd": "REAL",
+}
+
+_COLUMN_MIGRATIONS = {
+    "equity": {"run_id": "TEXT"},
+    "price_ticks": {"run_id": "TEXT", "received_at": "REAL", "source_ts": "REAL"},
+    "game_states": {"run_id": "TEXT", "received_at": "REAL"},
+    "decisions": {"run_id": "TEXT"},
+    "paper_positions": {"entry_fee": "REAL NOT NULL DEFAULT 0"},
 }
 
 _DECISION_COLUMNS = (
     "ts", "market", "strategy", "stage", "outcome", "mid", "move", "flips",
     "realized_vol", "fair_home", "side", "price", "fair", "edge", "spread",
-    "quote_age", "margin", "inning", "is_top", "home_score", "away_score",
+    "quote_age", "margin", "inning", "is_top", "home_score", "away_score", "run_id",
 )
 
 
@@ -151,6 +179,7 @@ class Journal:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.active_run_id: str | None = None
         self._migrate()
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
@@ -171,7 +200,22 @@ class Journal:
         price_cols = self._table_columns("price_ticks")
         if price_cols and self._price_ticks_needs_rebuild(price_cols):
             self._rebuild_price_ticks(price_cols)
+        for table, columns in _COLUMN_MIGRATIONS.items():
+            existing = self._table_columns(table)
+            for name, ddl in columns.items():
+                if existing and name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
         self.conn.commit()
+
+    def start_run(self, mode: str, config_hash: str, code_revision: str = "unknown") -> str:
+        run_id = uuid.uuid4().hex
+        self.conn.execute(
+            "INSERT INTO runs (id, started_at, mode, config_hash, code_revision) VALUES (?,?,?,?,?)",
+            (run_id, time.time(), mode, config_hash, code_revision),
+        )
+        self.conn.commit()
+        self.active_run_id = run_id
+        return run_id
 
     @staticmethod
     def _price_ticks_needs_rebuild(cols: dict[str, sqlite3.Row]) -> bool:
@@ -218,18 +262,21 @@ class Journal:
                     *, trade_id: str = "", fair: float | None = None,
                     edge: float | None = None, move: float | None = None,
                     spread: float | None = None, intended_price: float | None = None,
-                    slippage: float | None = None):
+                    slippage: float | None = None, fee_usd: float = 0.0,
+                    commit: bool = True):
         self.conn.execute(
             """INSERT INTO trades
                (ts, trade_id, strategy, action, market, team, token, qty, price,
-                fair, edge, move, spread, intended_price, slippage, reason)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                fair, edge, move, spread, intended_price, slippage, reason, run_id, fee_usd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), trade_id, strategy, "OPEN", market, team, token, qty, price,
                 fair, edge, move, spread, intended_price, slippage, reason,
+                self.active_run_id, fee_usd,
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def record_close(self, strategy, market, team, token, qty, price,
                      pnl_usd, pnl_pct, reason="", *, trade_id: str = "",
@@ -237,25 +284,27 @@ class Journal:
                      move: float | None = None, spread: float | None = None,
                      intended_price: float | None = None,
                      slippage: float | None = None,
-                     exit_kind: str | None = None):
+                     exit_kind: str | None = None, fee_usd: float = 0.0,
+                     commit: bool = True):
         self.conn.execute(
             """INSERT INTO trades
                (ts, trade_id, strategy, action, market, team, token, qty, price,
                 fair, edge, move, spread, intended_price, slippage, exit_kind,
-                pnl_usd, pnl_pct, reason)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                pnl_usd, pnl_pct, reason, run_id, fee_usd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), trade_id, strategy, "CLOSE", market, team, token, qty, price,
                 fair, edge, move, spread, intended_price, slippage, exit_kind,
-                pnl_usd, pnl_pct, reason,
+                pnl_usd, pnl_pct, reason, self.active_run_id, fee_usd,
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def record_equity(self, strategy, equity, cash, open_positions):
         self.conn.execute(
-            "INSERT INTO equity (ts, strategy, equity, cash, open_positions) VALUES (?,?,?,?,?)",
-            (time.time(), strategy, equity, cash, open_positions),
+            "INSERT INTO equity (ts, strategy, equity, cash, open_positions, run_id) VALUES (?,?,?,?,?,?)",
+            (time.time(), strategy, equity, cash, open_positions, self.active_run_id),
         )
         self.conn.commit()
 
@@ -263,12 +312,13 @@ class Journal:
         self.conn.execute(
             """INSERT INTO price_ticks
                (ts, market, home_team, away_team, home_bid, home_ask, home_mid,
-                home_spread, long_bid, long_ask, two_sided, source)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                home_spread, long_bid, long_ask, two_sided, source, run_id, received_at, source_ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 quote.ts, market.key, market.home_team, market.away_team,
                 quote.home_bid, quote.home_ask, quote.home_mid, quote.home_spread,
-                quote.long_bid, quote.long_ask, 1, "bbo",
+                quote.long_bid, quote.long_ask, 1, "bbo", self.active_run_id,
+                quote.ts, quote.source_ts,
             ),
         )
         self.conn.commit()
@@ -276,10 +326,10 @@ class Journal:
     def record_mark(self, market: Market, home_mid: float, long_last: float | None):
         self.conn.execute(
             """INSERT INTO price_ticks
-               (ts, market, home_team, away_team, home_mid, two_sided, source)
-               VALUES (?,?,?,?,?,?,?)""",
+               (ts, market, home_team, away_team, home_mid, two_sided, source, run_id, received_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (time.time(), market.key, market.home_team, market.away_team,
-             home_mid, 0, "mark"),
+             home_mid, 0, "mark", self.active_run_id, time.time()),
         )
         self.conn.commit()
 
@@ -287,13 +337,13 @@ class Journal:
         self.conn.execute(
             """INSERT INTO game_states
                (ts, game_pk, inning, is_top, outs, home_score, away_score,
-                on_first, on_second, on_third, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                on_first, on_second, on_third, status, run_id, received_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time() if ts is None else ts,
                 gs.game_pk, gs.inning, int(gs.is_top), gs.outs,
                 gs.home_score, gs.away_score, int(gs.on_first), int(gs.on_second),
-                int(gs.on_third), gs.status,
+                int(gs.on_third), gs.status, self.active_run_id, gs.received_at,
             ),
         )
         self.conn.commit()
@@ -322,6 +372,7 @@ class Journal:
         for row in rows:
             item = {col: row.get(col) for col in _DECISION_COLUMNS}
             item["ts"] = item["ts"] if item["ts"] is not None else now
+            item["run_id"] = item["run_id"] or self.active_run_id
             values.append(tuple(item[col] for col in _DECISION_COLUMNS))
         placeholders = ",".join("?" for _ in _DECISION_COLUMNS)
         self.conn.executemany(
@@ -340,7 +391,7 @@ class Journal:
             f"WHERE strategy IN ({placeholders})", strategies,
         ).fetchall()
         positions = self.conn.execute(
-            f"SELECT strategy, token, market, team, qty, entry_price, opened_at, trade_id "
+            f"SELECT strategy, token, market, team, qty, entry_price, entry_fee, opened_at, trade_id "
             f"FROM paper_positions WHERE strategy IN ({placeholders})", strategies,
         ).fetchall()
         return (
@@ -348,11 +399,11 @@ class Journal:
             [dict(r) for r in positions],
         )
 
-    def save_paper_state(self, broker) -> None:
+    def save_paper_state(self, broker, commit: bool = True) -> None:
         """Atomically checkpoint a PaperBroker ledger after every fill."""
         strategies = list(broker.cash)
         now = time.time()
-        with self.conn:
+        def save() -> None:
             for strategy in strategies:
                 self.conn.execute(
                     """INSERT INTO paper_accounts (strategy, cash, realized, closes, updated_at)
@@ -366,14 +417,20 @@ class Journal:
                 self.conn.execute("DELETE FROM paper_positions WHERE strategy = ?", (strategy,))
                 self.conn.executemany(
                     """INSERT INTO paper_positions
-                       (strategy, token, market, team, qty, entry_price, opened_at, trade_id)
-                       VALUES (?,?,?,?,?,?,?,?)""",
+                       (strategy, token, market, team, qty, entry_price, entry_fee, opened_at, trade_id)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
                     [
                         (position.strategy, position.token, position.market_key, position.team,
-                         position.qty, position.entry_price, position.opened_at, position.trade_id)
+                         position.qty, position.entry_price, position.entry_fee,
+                         position.opened_at, position.trade_id)
                         for position in broker.open_positions(strategy)
                     ],
                 )
+        if commit:
+            with self.conn:
+                save()
+        else:
+            save()
 
     def realized_pnl(self, strategy: str, start: float, end: float) -> float:
         row = self.conn.execute(
@@ -517,7 +574,8 @@ class Journal:
             params.append(end)
         rows = self.conn.execute(
             f"""SELECT ts, market, home_team, away_team, home_bid, home_ask,
-                       home_mid, home_spread, long_bid, long_ask, two_sided, source
+                       home_mid, home_spread, long_bid, long_ask, two_sided, source,
+                       run_id, received_at, source_ts
                 FROM price_ticks
                 WHERE {' AND '.join(where)}
                 ORDER BY ts""",
