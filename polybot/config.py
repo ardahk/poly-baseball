@@ -83,6 +83,7 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     ai: AIConfig = field(default_factory=AIConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
+    strategies: list[dict] = field(default_factory=list)  # frozen-variant registry
 
 
 def _apply(dc, data: dict):
@@ -102,6 +103,8 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         _apply(cfg.risk, raw.get("risk"))
         _apply(cfg.ai, raw.get("ai"))
         _apply(cfg.engine, raw.get("engine"))
+        if isinstance(raw.get("strategies"), list):
+            cfg.strategies = raw["strategies"]
     if not os.environ.get("ANTHROPIC_API_KEY"):
         cfg.ai.enabled = False
     return cfg
