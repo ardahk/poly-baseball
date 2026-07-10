@@ -8,7 +8,7 @@ Usage:
   python main.py run --live --yes-live  # real orders without prompt (systemd)
   python main.py scan            # one-shot: show tradeable markets right now
   python main.py status          # show database activity: ticks/trades/equity
-  python main.py report          # math-vs-AI performance comparison
+  python main.py report          # frozen-strategy performance comparison
   python main.py review          # end-of-day observability review
   python main.py backtest calibrate --days 3   # is the win-prob formula accurate?
   python main.py backtest strategy  --days 2   # would the trading logic profit?
@@ -170,7 +170,7 @@ def main():
     )
     sub.add_parser("scan", help="show current MLB markets and model fair values")
     sub.add_parser("status", help="show database activity and recent price ticks")
-    sub.add_parser("report", help="print math-vs-AI performance report")
+    sub.add_parser("report", help="print frozen-strategy performance report")
     p_review = sub.add_parser("review", help="review a recorded paper-trading day")
     p_review.add_argument("--date", help="local date to review, YYYY-MM-DD (default: today)")
     p_review.add_argument(
