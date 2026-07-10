@@ -85,6 +85,44 @@ def test_fade_rejects_when_execution_cost_eats_edge():
     assert d.signal_candidate is True
 
 
+def test_fade_edge_is_net_of_round_trip_fees():
+    s = FadeStrategy("fade_v1_frozen", "v1", CFG)
+    gs = GameState(1, status="Live", inning=7, is_top=True, home_score=4, away_score=1)
+    h = playful([0.60, 0.40, 0.60, 0.60, 0.40])
+    c = StratContext(market=market(), history=h, game_state=gs,
+                     quote=MarketQuote("m1", 0.39, 0.41, 0.39, 0.41), now=1000.0,
+                     fee_theta=0.06)
+    d = s.evaluate(c)
+    assert d.outcome == "signal"
+    fee = c.round_trip_fee(0.41, d.intent.fair)
+    assert fee > 0
+    assert d.intent.edge == pytest.approx(d.intent.fair - 0.41 - fee)
+
+
+def test_fade_wide_spread_tracks_signal_without_trading():
+    s = FadeStrategy("fade_v1_frozen", "v1", CFG)
+    gs = GameState(1, status="Live", inning=7, is_top=True, home_score=4, away_score=1)
+    h = playful([0.60, 0.40, 0.60, 0.60, 0.40])
+    # Fresh but very wide book (spread 0.30 >> max_spread) — exactly when fades fire.
+    c = StratContext(market=market(), history=h, game_state=gs,
+                     quote=MarketQuote("m1", 0.25, 0.55, 0.25, 0.55), now=1000.0)
+    d = s.evaluate(c)
+    assert d.outcome == "wide_spread"
+    assert d.intent is None
+    assert d.signal_candidate is True
+
+
+def test_fade_no_quote_still_yields_signal_candidate():
+    s = FadeStrategy("fade_v1_frozen", "v1", CFG)
+    gs = GameState(1, status="Live", inning=7, is_top=True, home_score=4, away_score=1)
+    h = playful([0.60, 0.40, 0.60, 0.60, 0.40])
+    c = StratContext(market=market(), history=h, game_state=gs, quote=None, now=1000.0)
+    d = s.evaluate(c)
+    assert d.outcome == "no_quote"
+    assert d.intent is None
+    assert d.signal_candidate is True
+
+
 def test_fade_no_signal_passes_through_outcome():
     s = FadeStrategy("fade_v1_frozen", "v1", CFG)
     h = playful([0.60, 0.60, 0.60, 0.48])   # not playful

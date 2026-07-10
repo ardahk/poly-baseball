@@ -88,6 +88,17 @@ def test_parse_token_validates_shape():
         parse_token("market-slug:YES")
 
 
+def test_live_broker_prices_convert_short_to_long_units():
+    from polybot.broker import LiveBroker
+    # Polymarket US requires price.value in LONG units for every intent. A SHORT
+    # price s must be sent (and read back) as 1 - s. LONG passes through.
+    assert LiveBroker._to_long_price("LONG", 0.30) == pytest.approx(0.30)
+    assert LiveBroker._to_long_price("SHORT", 0.30) == pytest.approx(0.70)
+    # Its own inverse: converting a fill's long price back recovers the side price.
+    long_px = LiveBroker._to_long_price("SHORT", 0.30)
+    assert LiveBroker._to_long_price("SHORT", long_px) == pytest.approx(0.30)
+
+
 def test_risk_max_positions(broker):
     risk = RiskManager(RiskConfig(max_positions=1, stake_usd=10), ["math"])
     assert risk.can_open(broker, "math", "m1")

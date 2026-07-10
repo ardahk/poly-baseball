@@ -117,6 +117,21 @@ def test_exit_on_game_final():
     assert "game final" in check_exit(pos(0.50), 0.99, None, True, cfg)
 
 
+def test_take_profit_is_net_of_round_trip_fees():
+    from polybot.strategy import net_exit_pnl_pct
+    cfg = StrategyConfig(take_profit=0.12, stop_loss=0.30)
+    # Entry 0.50 with its fee already booked; selling at 0.56 is a nominal +12%.
+    booked = Position(strategy="s", market_key="m", token="m:LONG", team="T",
+                      qty=20.0, entry_price=0.50, entry_fee=0.30)
+    # Net of the exit taker fee, that +12% no longer clears the bar -> hold.
+    assert check_exit(booked, 0.56, None, False, cfg, fee_theta=0.06) is None
+    assert net_exit_pnl_pct(booked, 0.56, fee_theta=0.06) < 0.12
+    # With no fees the identical sale trips take profit (back-compat default).
+    gross = Position(strategy="s", market_key="m", token="m:LONG", team="T",
+                     qty=20.0, entry_price=0.50)
+    assert "take profit" in check_exit(gross, 0.56, None, False, cfg)
+
+
 def test_exit_edge_gone():
     cfg = StrategyConfig(edge_exit=0.03)
     assert "edge gone" in check_exit(pos(0.50), 0.52, 0.45, False, cfg)

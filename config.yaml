@@ -25,6 +25,10 @@ strategy:
   flip_band: 0.03             #   ...beyond this band around 0.5
   min_volatility: 0.015       # OR realized vol >= this
   vol_window: 30
+  signal_episode_secs: 120    # collapse a continuously-firing signal into ONE
+                              # logged episode; a new one starts only after the
+                              # condition goes quiet this long (avoids dependent
+                              # duplicate rows in signals/counterfactuals)
 
 risk:
   stake_usd: 5                # base notional per trade

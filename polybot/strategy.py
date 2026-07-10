@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 
+from .broker import taker_fee
 from .config import StrategyConfig
 from .models import EntryEvaluation, GameState, Market, Position, Signal
 from .volatility import PriceHistory
@@ -144,6 +145,18 @@ def evaluate_entry(
     )
 
 
+def net_exit_pnl_pct(position: Position, sell_price: float, fee_theta: float = 0.0) -> float:
+    """P&L% of closing at `sell_price`, net of entry and exit taker fees.
+
+    Entry fee is already booked in `position.cost`; the exit fee is charged on
+    the sell. Take-profit/stop thresholds run on THIS number so a nominal +12%
+    that a round trip of taker fees would erase is not mistaken for a winner.
+    """
+    exit_fee = taker_fee(fee_theta, sell_price, position.qty)
+    proceeds = position.qty * sell_price - exit_fee
+    return proceeds / position.cost - 1.0
+
+
 def check_exit(
     position: Position,
     current_price: float,
@@ -151,10 +164,11 @@ def check_exit(
     game_final: bool,
     cfg: StrategyConfig,
     now: float | None = None,
+    fee_theta: float = 0.0,
 ) -> str | None:
-    """Return a close reason, or None to hold."""
+    """Return a close reason, or None to hold. Thresholds are net of fees."""
     now = now if now is not None else time.time()
-    pnl = position.pnl_pct(current_price)
+    pnl = net_exit_pnl_pct(position, current_price, fee_theta)
     if game_final:
         return f"game final (pnl {pnl:+.1%})"
     if pnl >= cfg.take_profit:

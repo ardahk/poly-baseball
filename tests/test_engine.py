@@ -136,16 +136,31 @@ def test_short_home_side_inverts_book(tmp_path):
     assert quote.home_ask == 0.60
 
 
-def test_stale_quote_blocks_entries_and_is_counted(tmp_path):
+def _seed_fade_signal(engine, market, now):
+    """Seed a playful, sharply-down home price so the fade wants the home token."""
+    engine.game_states[market.game_pk] = GameState(
+        market.game_pk, status="Live", inning=7, is_top=True,
+        home_score=4, away_score=1)
+    history = engine.histories[market.key]
+    for offset, price in [(-100, 0.62), (-75, 0.38), (-50, 0.62), (-25, 0.55), (0, 0.40)]:
+        history.add(price, ts=now + offset)
+
+
+def test_stale_quote_blocks_trade_but_still_records_signal(tmp_path):
     engine = make_engine(tmp_path)
     market = tracked_market(engine)
-    engine._poll_prices({market.slug: BookQuote(long_bid=0.50, long_ask=0.52,
-                                                long_last=0.51)})
-    engine.latest_quotes[market.key].ts = time.time() - 120  # stale
+    now = time.time()
+    _seed_fade_signal(engine, market, now)
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.39, 0.41, 0.39, 0.41, ts=now - 120)  # fresh signal, stale book
 
     engine._look_for_entries()
 
-    assert engine.funnel.get("stale_quote") == 1
+    assert engine.funnel.get("stale_quote", 0) >= 1
+    assert engine.broker.open_positions("fade_v1_frozen") == []  # not tradeable
+    outcome = engine.journal.conn.execute(
+        "SELECT outcome FROM signals WHERE strategy='fade_v1_frozen'").fetchone()
+    assert outcome["outcome"] == "stale_quote"  # signal captured despite stale book
 
 
 def test_discovery_only_tracks_matched_markets(tmp_path):
@@ -196,6 +211,98 @@ def test_engine_runs_multiple_frozen_strategies(tmp_path):
     assert "fade_v1_frozen" in engine.strategies
     assert "fade_tight" in engine.strategies
     assert set(engine.broker.cash) == set(engine.strategies)
+
+
+def test_wide_spread_records_signal_and_queues_counterfactual(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    now = time.time()
+    _seed_fade_signal(engine, market, now)
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.30, 0.50, 0.30, 0.50, ts=now)  # fresh but wide
+
+    engine._look_for_entries()
+
+    assert engine.broker.open_positions("fade_v1_frozen") == []
+    row = engine.journal.conn.execute(
+        "SELECT outcome FROM signals WHERE strategy='fade_v1_frozen'").fetchone()
+    assert row["outcome"] == "wide_spread"
+    assert any(p["market_key"] == market.key for p in engine.pending_cf)
+
+
+def test_persistent_signal_registers_one_episode(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    now = time.time()
+    _seed_fade_signal(engine, market, now)
+    # Stale book keeps it a signal-grade candidate (never opens) across ticks.
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.39, 0.41, 0.39, 0.41, ts=now - 120)
+
+    engine._look_for_entries()
+    engine._look_for_entries()
+    engine._look_for_entries()
+
+    count = engine.journal.conn.execute(
+        "SELECT COUNT(*) c FROM signals WHERE strategy='fade_v1_frozen'"
+    ).fetchone()["c"]
+    assert count == 1  # one episode -> one row, not one-per-tick
+
+
+def test_orphaned_position_rehydrates_market_and_settles(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    engine.journal.record_market(market)
+    engine.broker.open("fade_v1_frozen", market.key, market.home_token,
+                       market.home_team, 0.50, 10.0)
+    engine._save_paper_account()
+    engine.journal.close()
+
+    restarted = make_engine(tmp_path)
+    try:
+        assert market.key in restarted.markets  # rehydrated despite closed discovery
+        restarted._settle_final_game(
+            GameState(1, home_score=5, away_score=2, status="Final"))
+        assert restarted.broker.open_positions("fade_v1_frozen") == []
+    finally:
+        restarted.journal.close()
+
+
+def test_pending_counterfactuals_survive_restart(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    engine.journal.record_market(market)
+    sid = engine.journal.record_signal(
+        strategy="fade_v1_frozen", market=market.key, token=market.home_token,
+        side_team="Homers", entry_price=0.52, fair=0.6, edge=0.08, move=-0.1,
+        spread=0.02, inning=7, is_top=1, home_score=4, away_score=1)
+    engine.journal.record_pending_cf(sid, market.home_token, market.key, time.time() - 10)
+    engine.journal.record_counterfactual(sid, 5, exec_bid=0.50, exec_ask=0.52,
+                                         mid=0.51, two_sided=1, spread=0.02)
+    engine.journal.close()
+
+    restarted = make_engine(tmp_path)
+    try:
+        pend = [p for p in restarted.pending_cf if p["signal_id"] == sid]
+        assert len(pend) == 1
+        assert 5 not in pend[0]["remaining"]   # already captured before restart
+        assert 300 in pend[0]["remaining"]     # still pending
+    finally:
+        restarted.journal.close()
+
+
+def test_run_freezes_strategy_registry(tmp_path):
+    engine = make_engine(tmp_path)
+    rows = engine.journal.conn.execute(
+        "SELECT strategy, version, kind, config_hash FROM strategy_registry WHERE run_id=?",
+        (engine.run_id,)).fetchall()
+    by_name = {r["strategy"]: r for r in rows}
+    assert {"fade_v1_frozen", "fade_tight"} <= set(by_name)
+    assert by_name["fade_v1_frozen"]["version"] == "v1"
+    assert by_name["fade_v1_frozen"]["kind"] == "fade"
+    assert by_name["fade_v1_frozen"]["config_hash"]
+    # different frozen configs must hash differently
+    assert by_name["fade_v1_frozen"]["config_hash"] != by_name["fade_tight"]["config_hash"]
 
 
 def test_counterfactuals_recorded_after_horizon(tmp_path):

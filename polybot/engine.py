@@ -54,9 +54,7 @@ class Engine:
         self.run_id = self.journal.start_run(
             "paper", config_hash, os.environ.get("POLYBOT_CODE_REVISION", "unknown")
         )
-        self._restore_paper_account()
-        self.journal.save_paper_state(self.broker)
-        self.session_realized = dict(self.broker.realized)
+        self._record_strategy_registry()
         self.risk = RiskManager(cfg.risk, self.strategies)
         self.mlb = mlb.MLBClient()
 
@@ -70,11 +68,22 @@ class Engine:
         # Signals awaiting counterfactual snapshots: each is
         # {signal_id, token, market_key, born, remaining:set[int]}.
         self.pending_cf: list[dict] = []
+        # Active signal episodes: (strategy, market, token) -> last-fired ts. New
+        # episodes register a signal; continuations refresh the timestamp only.
+        self.active_signals: dict[tuple[str, str, str], float] = {}
 
         self._last_discovery = 0.0
         self._last_game_poll = 0.0
         self._last_equity = 0.0
         self._last_status_log = 0.0
+
+        # Restore prior paper ledger + in-flight counterfactuals now that all
+        # runtime state exists. Restore also rehydrates the markets of any
+        # orphaned positions so their games get polled to settlement.
+        self._restore_paper_account()
+        self._restore_pending_cf()
+        self.journal.save_paper_state(self.broker)
+        self.session_realized = dict(self.broker.realized)
 
     def _restore_paper_account(self) -> None:
         accounts, saved_positions = self.journal.paper_state(self.strategies)
@@ -91,6 +100,55 @@ class Engine:
             restored_positions = sum(len(self.broker.open_positions(s)) for s in self.strategies)
             self._event("restored paper account (%d position%s)", restored_positions,
                         "s" if restored_positions != 1 else "")
+            self._rehydrate_markets_for_open_positions()
+
+    def _rehydrate_markets_for_open_positions(self) -> None:
+        """Reload markets for restored positions so orphaned games settle.
+
+        Discovery skips closed markets, so a position restored after its game
+        ended would never re-enter `self.markets`, never be polled, and never
+        settle — locking cash forever. Rebuild those markets from the journal.
+        """
+        needed = {
+            pos.market_key
+            for strat in self.strategies
+            for pos in self.broker.open_positions(strat)
+            if pos.market_key not in self.markets
+        }
+        for market in self.journal.markets_by_slugs(sorted(needed)):
+            self.markets[market.key] = market
+            self.histories.setdefault(market.key, PriceHistory(self.cfg.strategy.flip_band))
+        missing = needed - set(self.markets)
+        if missing:
+            self._event("warning: %d restored position(s) reference unknown markets: %s",
+                        len(missing), ", ".join(sorted(missing)))
+
+    def _restore_pending_cf(self) -> None:
+        """Reload signals still inside their counterfactual window after a restart."""
+        for row in self.journal.pending_counterfactuals():
+            remaining = set(HORIZONS) - row["done"]
+            if remaining:
+                self.pending_cf.append({
+                    "signal_id": row["signal_id"], "token": row["token"],
+                    "market_key": row["market_key"], "born": row["born"],
+                    "remaining": remaining,
+                })
+            else:
+                self.journal.delete_pending_cf([row["signal_id"]])
+
+    def _record_strategy_registry(self) -> None:
+        """Freeze each strategy's version + config hash for this run's provenance."""
+        entries = []
+        for strat in self.strategy_objs:
+            config_json = json.dumps(asdict(strat.config), sort_keys=True,
+                                     separators=(",", ":"))
+            payload = f"{strat.kind}:{strat.version}:{config_json}"
+            entries.append({
+                "strategy": strat.name, "version": strat.version, "kind": strat.kind,
+                "config_hash": hashlib.sha256(payload.encode()).hexdigest(),
+                "config_json": config_json,
+            })
+        self.journal.record_strategy_registry(entries)
 
     def _save_paper_account(self) -> None:
         self.journal.save_paper_state(self.broker)
@@ -209,6 +267,7 @@ class Engine:
         return now >= market.start_time - self.cfg.engine.pregame_game_state_window_secs
 
     def _poll_prices(self, quotes: dict[str, pmus.BookQuote]):
+        wrote = False
         for market in self.markets.values():
             gs = self.game_states.get(market.game_pk)
             if not gs or not gs.is_live:
@@ -218,7 +277,7 @@ class Engine:
                 continue
             if book.two_sided:
                 quote = self._to_home_quote(market, book)
-                self.journal.record_price(market, quote)
+                self.journal.record_price(market, quote, commit=False)
                 self.latest_quotes[market.key] = quote
                 home_mid = quote.home_mid
                 # Long positions liquidate at their bid; short positions at
@@ -231,7 +290,7 @@ class Engine:
                 # but leave latest_quotes stale so entries stay blocked.
                 home_mid = book.long_last if market.home_is_long \
                     else 1.0 - book.long_last
-                self.journal.record_mark(market, home_mid, book.long_last)
+                self.journal.record_mark(market, home_mid, book.long_last, commit=False)
                 # A mark is useful for observability only. It must never be
                 # paired with a previous BBO to create an executable order.
                 self.latest_quotes.pop(market.key, None)
@@ -239,6 +298,9 @@ class Engine:
                 self.latest_quotes.pop(market.key, None)
                 continue
             self.histories[market.key].add(home_mid)
+            wrote = True
+        if wrote:
+            self.journal.conn.commit()
 
     @staticmethod
     def _to_home_quote(market: Market, book: pmus.BookQuote) -> MarketQuote:
@@ -267,7 +329,8 @@ class Engine:
                 if quote is None or now - quote.ts > self.cfg.strategy.max_quote_age_secs:
                     continue
                 gs = self.game_states.get(market.game_pk)
-                ctx = StratContext(market, self.histories[market.key], gs, quote, now)
+                ctx = StratContext(market, self.histories[market.key], gs, quote, now,
+                                   fee_theta=self.cfg.engine.paper_taker_fee_theta)
                 for ex in strat.manage(ctx, [pos]):
                     self._close(strat.name, ex.position, ex.price, ex.reason, fair=ex.fair)
 
@@ -330,7 +393,6 @@ class Engine:
         }
 
     def _look_for_entries(self):
-        scfg = self.cfg.strategy
         now = time.time()
         day_start, day_end, day_key = day_bounds(timezone=self.cfg.engine.report_timezone)
         rows: list[dict] = []
@@ -338,28 +400,14 @@ class Engine:
             gs = self.game_states.get(market.game_pk)
             if not gs or not gs.is_live:
                 continue  # not counted: pending/final markets aren't candidates
+            # Always show the market to every strategy — even on a stale or
+            # wide-spread book. Spreads blow out during exactly the sharp moves
+            # a fade wants, so each strategy applies its OWN executability gate
+            # (and we still capture the signal + counterfactuals). The quote may
+            # be None (one-sided book); the price history is kept alive by marks.
             quote = self.latest_quotes.get(market.key)
-            if quote is None or now - quote.ts > scfg.max_quote_age_secs:
-                self._bump("stale_quote")
-                quote_age = (now - quote.ts) if quote else None
-                rows.append(self._decision_row(
-                    market, gs, "engine", "stale_quote", quote=quote,
-                    quote_age=quote_age,
-                    margin=(scfg.max_quote_age_secs - quote_age)
-                    if quote_age is not None else None,
-                    ts=now,
-                ))
-                continue
-            if quote.home_spread > scfg.max_spread:
-                self._bump("wide_spread")
-                rows.append(self._decision_row(
-                    market, gs, "engine", "wide_spread", quote=quote,
-                    quote_age=now - quote.ts,
-                    margin=scfg.max_spread - quote.home_spread,
-                    ts=now,
-                ))
-                continue
-            ctx = StratContext(market, self.histories[market.key], gs, quote, now)
+            ctx = StratContext(market, self.histories[market.key], gs, quote, now,
+                               fee_theta=self.cfg.engine.paper_taker_fee_theta)
             for strat in self.strategy_objs:
                 self._evaluate_strategy(strat, ctx, gs, quote, now,
                                         day_start, day_end, day_key, rows)
@@ -368,15 +416,16 @@ class Engine:
     def _evaluate_strategy(self, strat, ctx, gs, quote, now,
                            day_start, day_end, day_key, rows):
         market = ctx.market
+        quote_age = None if quote is None else now - quote.ts
         d = strat.evaluate(ctx)
         self._bump(d.outcome)
         ev = d.evaluation or (d.intent.evaluation if d.intent else None)
         rows.append(self._decision_row(
             market, gs, "strategy", d.outcome, strategy_name=strat.name,
-            ev=ev, quote=quote, quote_age=now - quote.ts, ts=now,
+            ev=ev, quote=quote, quote_age=quote_age, ts=now,
         ))
         if d.signal_candidate and ev is not None and ev.signal is not None:
-            self._register_signal(strat.name, ctx, ev)
+            self._maybe_register_signal(strat, ctx, d)
 
         intent = d.intent
         if intent is None:
@@ -385,13 +434,13 @@ class Engine:
             self._bump("cooldown")
             rows.append(self._decision_row(
                 market, gs, "post_signal", "cooldown", strategy_name=strat.name,
-                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+                ev=ev, quote=quote, quote_age=quote_age, ts=now))
             return
         if intent.token in self.broker.positions[strat.name]:
             self._bump("already_open")
             rows.append(self._decision_row(
                 market, gs, "post_signal", "already_open", strategy_name=strat.name,
-                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+                ev=ev, quote=quote, quote_age=quote_age, ts=now))
             return
         stake = self._stake_for_intent(intent, quote)
         daily_realized = self.journal.realized_pnl(strat.name, day_start, day_end)
@@ -402,7 +451,7 @@ class Engine:
             self._bump("risk_blocked")
             rows.append(self._decision_row(
                 market, gs, "post_signal", "risk_blocked", strategy_name=strat.name,
-                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+                ev=ev, quote=quote, quote_age=quote_age, ts=now))
             return
         entry_price = ctx.entry_price(intent.token)
         reason = f"{intent.reason}; spread {quote.home_spread:.3f}; stake ${stake:.0f}"
@@ -412,7 +461,7 @@ class Engine:
             self._bump("opened")
             rows.append(self._decision_row(
                 market, gs, "post_signal", "opened", strategy_name=strat.name,
-                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+                ev=ev, quote=quote, quote_age=quote_age, ts=now))
             self._event("[%s] OPEN %s @ %.3f - %s",
                         strat.name, intent.side_team, pos.entry_price, reason)
             with self.journal.conn:
@@ -429,19 +478,48 @@ class Engine:
         else:
             rows.append(self._decision_row(
                 market, gs, "post_signal", "open_failed", strategy_name=strat.name,
-                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+                ev=ev, quote=quote, quote_age=quote_age, ts=now))
 
-    def _register_signal(self, strat_name: str, ctx: StratContext, ev) -> None:
+    def _maybe_register_signal(self, strat, ctx: StratContext, d) -> None:
+        """Record ONE signal per episode; refresh the episode on continuations.
+
+        A signal condition persisting across ticks would otherwise write a fresh
+        row (and six counterfactuals) every 2s — dozens of dependent duplicates
+        per real event. We register only when an episode is new, i.e. the signal
+        went quiet for `signal_episode_secs` before firing again.
+        """
+        sig = d.evaluation.signal
+        key = (strat.name, ctx.market.key, sig.token)
+        last = self.active_signals.get(key)
+        self.active_signals[key] = ctx.now
+        if last is not None and ctx.now - last < strat.config.signal_episode_secs:
+            return  # same episode, already registered
+        self._register_signal(strat.name, ctx, d)
+
+    def _register_signal(self, strat_name: str, ctx: StratContext, d) -> None:
         """Log a signal-grade candidate and queue its counterfactual horizons."""
+        ev = d.evaluation
         sig = ev.signal
+        if ctx.quote is not None:
+            entry_price = ctx.entry_price(sig.token)
+            fee = ctx.round_trip_fee(entry_price, ev.fair)
+            edge = ev.fair - entry_price          # executable gross edge
+            net_edge = edge - fee
+            spread = ctx.quote.home_spread
+        else:
+            entry_price = fee = edge = net_edge = spread = None
+        gstate = ctx.game_state
         sid = self.journal.record_signal(
             strategy=strat_name, market=ctx.market.key, token=sig.token,
-            side_team=ev.side_team, entry_price=ctx.entry_price(sig.token),
-            fair=ev.fair, edge=ev.edge, move=ev.move, spread=ctx.quote.home_spread,
-            inning=ctx.game_state.inning, is_top=int(ctx.game_state.is_top),
-            home_score=ctx.game_state.home_score, away_score=ctx.game_state.away_score,
+            side_team=ev.side_team, entry_price=entry_price,
+            fair=ev.fair, edge=edge, net_edge=net_edge, fee=fee, outcome=d.outcome,
+            move=ev.move, spread=spread,
+            inning=gstate.inning, is_top=int(gstate.is_top),
+            home_score=gstate.home_score, away_score=gstate.away_score,
             commit=False,
         )
+        self.journal.record_pending_cf(sid, sig.token, ctx.market.key, ctx.now,
+                                       commit=False)
         self.pending_cf.append({
             "signal_id": sid, "token": sig.token, "market_key": ctx.market.key,
             "born": ctx.now, "remaining": set(HORIZONS),
@@ -451,6 +529,7 @@ class Engine:
         """Snapshot each pending signal's executable price at every elapsed horizon."""
         now = time.time()
         still: list[dict] = []
+        completed: list[int] = []
         dirty = False
         for sig in self.pending_cf:
             due = sorted(h for h in sig["remaining"] if now - sig["born"] >= h)
@@ -476,7 +555,11 @@ class Engine:
             sig["remaining"].difference_update(due)
             if sig["remaining"]:
                 still.append(sig)
+            else:
+                completed.append(sig["signal_id"])
         self.pending_cf = still
+        if completed:
+            self.journal.delete_pending_cf(completed, commit=False)
         if dirty:
             self.journal.conn.commit()
 

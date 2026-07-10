@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from . import strategy as _fade
 from .ai_judge import AIJudge
+from .broker import taker_fee
 from .config import AIConfig, StrategyConfig
 from .models import EntryEvaluation, GameState, Market, MarketQuote, Position
 from .volatility import PriceHistory
@@ -41,18 +42,32 @@ def executable_bid(market: Market, quote: MarketQuote, token: str) -> float:
 
 @dataclass
 class StratContext:
-    """The shared market/game observation every strategy decides against."""
+    """The shared market/game observation every strategy decides against.
+
+    `quote` may be None (one-sided/absent book): the price history stays alive
+    from mark prices so a signal can still be detected and tracked, but no
+    executable price exists, so nothing tradeable is produced.
+    """
     market: Market
     history: PriceHistory
     game_state: GameState | None
-    quote: MarketQuote
+    quote: MarketQuote | None
     now: float
+    fee_theta: float = 0.0
 
     def entry_price(self, token: str) -> float:
         return executable_ask(self.market, self.quote, token)
 
     def exit_price(self, token: str) -> float:
         return executable_bid(self.market, self.quote, token)
+
+    def round_trip_fee(self, entry_price: float, exit_price: float) -> float:
+        """Per-contract taker fee paid to open at `entry_price` and later close."""
+        return taker_fee(self.fee_theta, entry_price) + taker_fee(self.fee_theta, exit_price)
+
+    @property
+    def quote_age(self) -> float | None:
+        return None if self.quote is None else self.now - self.quote.ts
 
 
 @dataclass
@@ -89,6 +104,8 @@ class Decision:
 class Strategy:
     """Base interface. Subclasses decide entries/exits on a shared context."""
 
+    kind = "fade"
+
     def __init__(self, name: str, version: str, config: StrategyConfig):
         self.name = name
         self.version = version
@@ -112,9 +129,20 @@ class FadeStrategy(Strategy):
         if ev.signal is None:
             return Decision(evaluation=ev, outcome=ev.outcome)
         sig = ev.signal
+        cfg = self.config
+        # A signal-grade candidate exists: track it regardless of executability so
+        # counterfactuals capture even the wide-spread / stale moments where fades
+        # actually live. Only the *tradeable* path needs a fresh two-sided book.
+        if ctx.quote is None:
+            return Decision(evaluation=ev, outcome="no_quote", signal_candidate=True)
+        if ctx.quote_age is not None and ctx.quote_age > cfg.max_quote_age_secs:
+            return Decision(evaluation=ev, outcome="stale_quote", signal_candidate=True)
+        if ctx.quote.home_spread > cfg.max_spread:
+            return Decision(evaluation=ev, outcome="wide_spread", signal_candidate=True)
         exec_price = ctx.entry_price(sig.token)
-        edge = sig.fair - exec_price
-        if edge < self.config.min_edge:
+        fee = ctx.round_trip_fee(exec_price, sig.fair)
+        edge = sig.fair - exec_price - fee
+        if edge < cfg.min_edge:
             return Decision(evaluation=ev, outcome="execution_cost",
                             signal_candidate=True)
         intent = Intent(token=sig.token, side_team=sig.side_team,
@@ -133,7 +161,8 @@ class FadeStrategy(Strategy):
                 fair_home = _fade.fair_home_value(gs, self.config)
                 fair = fair_home if pos.token == ctx.market.home_token else 1.0 - fair_home
             reason = _fade.check_exit(pos, price, fair,
-                                      bool(gs and gs.is_final), self.config, now=ctx.now)
+                                      bool(gs and gs.is_final), self.config,
+                                      now=ctx.now, fee_theta=ctx.fee_theta)
             if reason:
                 out.append(ExitIntent(position=pos, price=price, reason=reason, fair=fair))
         return out
@@ -147,6 +176,8 @@ class AIShadowStrategy(Strategy):
     at the *then-current* executable price so judge latency and any adverse price
     drift during the think are reflected in the shadow ledger.
     """
+
+    kind = "ai_shadow"
 
     def __init__(self, name: str, version: str, base: FadeStrategy,
                  cfg: AIConfig | None = None, judge=None):

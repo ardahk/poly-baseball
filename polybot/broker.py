@@ -11,6 +11,16 @@ from .models import Position
 log = logging.getLogger(__name__)
 
 
+def taker_fee(theta: float, price: float, qty: float = 1.0) -> float:
+    """Polymarket US taker fee, UNrounded.
+
+    `theta * qty * price * (1 - price)`. Used for *decisions* (edge/exit math),
+    where per-contract cent rounding would collapse to $0.00 and hide the cost.
+    `PaperBroker.fee` applies the venue's banker's rounding for actual cash flows.
+    """
+    return theta * qty * price * (1.0 - price)
+
+
 def parse_token(token: str) -> tuple[str, str]:
     """Parse "<market-slug>:LONG" / "<market-slug>:SHORT" into (slug, side)."""
     slug, sep, side = token.rpartition(":")
@@ -37,7 +47,11 @@ class PaperBroker:
         self.last_fee: dict[str, float] = {s: 0.0 for s in strategies}
 
     def fee(self, price: float, qty: float) -> float:
-        """Exchange taker fee, rounded like the venue (banker's rounding)."""
+        """Exchange taker fee on an actual fill, rounded like the venue.
+
+        Banker's rounding to the cent mirrors real cash flows. For pre-trade
+        edge/exit decisions use the unrounded `taker_fee` free function instead.
+        """
         raw = Decimal(str(self.taker_fee_theta)) * Decimal(str(qty)) \
             * Decimal(str(price)) * (Decimal("1") - Decimal(str(price)))
         return float(raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN))
@@ -134,8 +148,9 @@ class LiveBroker(PaperBroker):
     tracking reflects real slippage rather than an optimistic assumption.
     """
 
-    def __init__(self, strategies: list[str], starting_cash: float, slippage: float = 0.01):
-        super().__init__(strategies, starting_cash, slippage)
+    def __init__(self, strategies: list[str], starting_cash: float, slippage: float = 0.01,
+                 taker_fee_theta: float = 0.0):
+        super().__init__(strategies, starting_cash, slippage, taker_fee_theta)
         try:
             from polymarket_us import PolymarketUS
         except ImportError as exc:
@@ -161,17 +176,32 @@ class LiveBroker(PaperBroker):
     }
     _FILL_TYPES = {"EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL"}
 
+    @staticmethod
+    def _to_long_price(side: str, side_price: float) -> float:
+        """Convert a side-relative price to LONG/YES units (its own inverse).
+
+        Polymarket US requires `price.value` in LONG units for every intent,
+        including BUY_SHORT/SELL_SHORT, and returns execution prices in LONG
+        units too. A SHORT price `s` corresponds to LONG price `1 - s`.
+        """
+        long_price = side_price if side == "LONG" else 1.0 - side_price
+        return min(max(long_price, 0.0001), 0.9999)
+
     def _submit(self, slug: str, side: str, action: str,
                limit_price: float, qty: float) -> tuple[float, float] | None:
-        """Returns (avg_fill_price, filled_qty), or None if nothing filled."""
+        """Submit an order whose limit is expressed in side-relative units.
+
+        Returns (avg_fill_price, filled_qty) in SIDE-relative units, or None.
+        """
         intent = self._INTENTS[(side, action)]
         order_qty = max(0.0001, round(qty, 4))
+        long_limit = self._to_long_price(side, limit_price)
         try:
             resp = self.client.orders.create({
                 "marketSlug": slug,
                 "intent": intent,
                 "type": "ORDER_TYPE_LIMIT",
-                "price": {"value": f"{limit_price:.4f}", "currency": "USD"},
+                "price": {"value": f"{long_limit:.4f}", "currency": "USD"},
                 "quantity": order_qty,
                 "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
                 "synchronousExecution": True,
@@ -187,7 +217,11 @@ class LiveBroker(PaperBroker):
         filled_qty = sum(float(e["lastShares"]) for e in fills)
         if filled_qty <= 0:
             return None
-        notional = sum(float(e["lastShares"]) * float(e["lastPx"]["value"]) for e in fills)
+        # lastPx is in LONG units; convert each fill back to side-relative units.
+        notional = sum(
+            float(e["lastShares"]) * self._to_long_price(side, float(e["lastPx"]["value"]))
+            for e in fills
+        )
         return notional / filled_qty, filled_qty
 
     def open(self, strategy, market_key, token, team, price, stake_usd):

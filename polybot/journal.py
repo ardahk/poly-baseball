@@ -152,9 +152,12 @@ CREATE TABLE IF NOT EXISTS signals (
     market TEXT NOT NULL,
     token TEXT NOT NULL,
     side_team TEXT,
-    entry_price REAL,
+    entry_price REAL,       -- executable ask at signal time (NULL if no book)
     fair REAL,
-    edge REAL,
+    edge REAL,              -- executable gross edge: fair - entry_price
+    net_edge REAL,          -- edge after estimated round-trip taker fees
+    fee REAL,               -- estimated round-trip taker fee (per contract)
+    outcome TEXT,           -- strategy outcome: signal|execution_cost|wide_spread|...
     move REAL,
     spread REAL,
     inning INTEGER,
@@ -173,6 +176,22 @@ CREATE TABLE IF NOT EXISTS signal_counterfactuals (
     two_sided INTEGER,
     spread REAL,
     PRIMARY KEY (signal_id, horizon_secs)
+);
+CREATE TABLE IF NOT EXISTS pending_counterfactuals (
+    signal_id INTEGER PRIMARY KEY,
+    token TEXT NOT NULL,
+    market TEXT NOT NULL,
+    born REAL NOT NULL,
+    run_id TEXT
+);
+CREATE TABLE IF NOT EXISTS strategy_registry (
+    run_id TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    version TEXT NOT NULL,
+    kind TEXT,
+    config_hash TEXT NOT NULL,
+    config_json TEXT,
+    PRIMARY KEY (run_id, strategy)
 );
 """
 
@@ -195,6 +214,7 @@ _COLUMN_MIGRATIONS = {
     "game_states": {"run_id": "TEXT", "received_at": "REAL"},
     "decisions": {"run_id": "TEXT"},
     "paper_positions": {"entry_fee": "REAL NOT NULL DEFAULT 0"},
+    "signals": {"net_edge": "REAL", "fee": "REAL", "outcome": "TEXT"},
 }
 
 _DECISION_COLUMNS = (
@@ -333,18 +353,71 @@ class Journal:
 
     def record_signal(self, *, strategy, market, token, side_team, entry_price,
                       fair, edge, move, spread, inning, is_top, home_score,
-                      away_score, ts=None, commit=True) -> int:
+                      away_score, net_edge=None, fee=None, outcome=None,
+                      ts=None, commit=True) -> int:
         cur = self.conn.execute(
             """INSERT INTO signals (ts, run_id, strategy, market, token, side_team,
-               entry_price, fair, edge, move, spread, inning, is_top,
-               home_score, away_score) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               entry_price, fair, edge, net_edge, fee, outcome, move, spread, inning,
+               is_top, home_score, away_score)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (time.time() if ts is None else ts, self.active_run_id, strategy, market,
-             token, side_team, entry_price, fair, edge, move, spread, inning, is_top,
-             home_score, away_score),
+             token, side_team, entry_price, fair, edge, net_edge, fee, outcome, move,
+             spread, inning, is_top, home_score, away_score),
         )
         if commit:
             self.conn.commit()
         return int(cur.lastrowid)
+
+    def record_strategy_registry(self, entries: list[dict], commit: bool = True) -> None:
+        """Freeze the per-run strategy roster (name, version, kind, config hash)."""
+        self.conn.executemany(
+            """INSERT OR REPLACE INTO strategy_registry
+               (run_id, strategy, version, kind, config_hash, config_json)
+               VALUES (?,?,?,?,?,?)""",
+            [
+                (self.active_run_id, e["strategy"], e["version"], e.get("kind"),
+                 e["config_hash"], e.get("config_json"))
+                for e in entries
+            ],
+        )
+        if commit:
+            self.conn.commit()
+
+    def record_pending_cf(self, signal_id, token, market, born, commit=True):
+        self.conn.execute(
+            """INSERT OR REPLACE INTO pending_counterfactuals
+               (signal_id, token, market, born, run_id) VALUES (?,?,?,?,?)""",
+            (signal_id, token, market, born, self.active_run_id),
+        )
+        if commit:
+            self.conn.commit()
+
+    def delete_pending_cf(self, signal_ids: list[int], commit=True):
+        if not signal_ids:
+            return
+        placeholders = ",".join("?" for _ in signal_ids)
+        self.conn.execute(
+            f"DELETE FROM pending_counterfactuals WHERE signal_id IN ({placeholders})",
+            signal_ids,
+        )
+        if commit:
+            self.conn.commit()
+
+    def pending_counterfactuals(self) -> list[dict]:
+        """Restore in-flight counterfactual signals with their already-filled horizons."""
+        rows = self.conn.execute(
+            """SELECT p.signal_id, p.token, p.market, p.born,
+                      GROUP_CONCAT(c.horizon_secs) AS done
+               FROM pending_counterfactuals p
+               LEFT JOIN signal_counterfactuals c ON c.signal_id = p.signal_id
+               GROUP BY p.signal_id, p.token, p.market, p.born"""
+        ).fetchall()
+        result = []
+        for r in rows:
+            done = {int(h) for h in (r["done"] or "").split(",") if h}
+            result.append({"signal_id": r["signal_id"], "token": r["token"],
+                           "market_key": r["market"], "born": r["born"], "done": done})
+        return result
 
     def record_counterfactual(self, signal_id, horizon_secs, *, exec_bid, exec_ask,
                               mid, two_sided, spread, ts=None, commit=True):
@@ -365,7 +438,7 @@ class Journal:
         )
         self.conn.commit()
 
-    def record_price(self, market, quote):
+    def record_price(self, market, quote, commit: bool = True):
         self.conn.execute(
             """INSERT INTO price_ticks
                (ts, market, home_team, away_team, home_bid, home_ask, home_mid,
@@ -378,9 +451,11 @@ class Journal:
                 quote.ts, quote.source_ts,
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
-    def record_mark(self, market: Market, home_mid: float, long_last: float | None):
+    def record_mark(self, market: Market, home_mid: float, long_last: float | None,
+                    commit: bool = True):
         self.conn.execute(
             """INSERT INTO price_ticks
                (ts, market, home_team, away_team, home_mid, two_sided, source, run_id, received_at)
@@ -388,7 +463,8 @@ class Journal:
             (time.time(), market.key, market.home_team, market.away_team,
              home_mid, 0, "mark", self.active_run_id, time.time()),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def record_game_state(self, gs: GameState, ts: float | None = None):
         self.conn.execute(
@@ -717,6 +793,23 @@ class Journal:
                     on_third=bool(r["on_third"]),
                     status=r["status"],
                 ),
+            )
+            for r in rows
+        ]
+
+    def markets_by_slugs(self, slugs: list[str]) -> list[Market]:
+        """Rehydrate recorded markets by slug (for restoring orphaned positions)."""
+        if not slugs:
+            return []
+        placeholders = ",".join("?" for _ in slugs)
+        rows = self.conn.execute(
+            f"SELECT * FROM markets WHERE slug IN ({placeholders})", slugs,
+        ).fetchall()
+        return [
+            Market(
+                slug=r["slug"], question=r["question"], home_team=r["home_team"],
+                away_team=r["away_team"], long_team=r["long_team"],
+                game_pk=r["game_pk"], start_time=r["start_time"],
             )
             for r in rows
         ]

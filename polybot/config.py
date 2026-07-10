@@ -40,6 +40,10 @@ class StrategyConfig:
     flip_band: float = 0.03              # hysteresis band around 0.5
     min_volatility: float = 0.015        # OR realized vol threshold
     vol_window: int = 30                 # samples for realized vol
+    # Signal capture: collapse a continuously-firing signal into ONE episode so
+    # the signals/counterfactuals tables aren't flooded with dependent samples.
+    # A new episode starts only after the condition goes quiet for this long.
+    signal_episode_secs: float = 120.0
 
 
 @dataclass
