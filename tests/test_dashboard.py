@@ -57,6 +57,8 @@ def test_terminal_dashboard_renders_engine_snapshot():
 
     output = stream.getvalue()
     assert "POLYBOT PAPER" in output
+    assert "persisted paper ledger" in output
+    assert "session" in output
     assert "Dodgers @ Giants" in output
     assert "STRATEGIES" in output
     assert "tracking: Dodgers vs Giants" in output

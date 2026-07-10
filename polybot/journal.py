@@ -108,6 +108,24 @@ CREATE TABLE IF NOT EXISTS markets (
     start_time REAL,
     first_seen_ts REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS paper_accounts (
+    strategy TEXT PRIMARY KEY,
+    cash REAL NOT NULL,
+    realized REAL NOT NULL,
+    closes INTEGER NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_positions (
+    strategy TEXT NOT NULL,
+    token TEXT NOT NULL,
+    market TEXT NOT NULL,
+    team TEXT NOT NULL,
+    qty REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    opened_at REAL NOT NULL,
+    trade_id TEXT NOT NULL,
+    PRIMARY KEY (strategy, token)
+);
 """
 
 _TRADE_V2_COLUMNS = {
@@ -311,6 +329,59 @@ class Journal:
             values,
         )
         self.conn.commit()
+
+    def paper_state(self, strategies: list[str]) -> tuple[dict[str, dict], list[dict]]:
+        """Return the latest persisted paper account state for active strategies."""
+        if not strategies:
+            return {}, []
+        placeholders = ",".join("?" for _ in strategies)
+        accounts = self.conn.execute(
+            f"SELECT strategy, cash, realized, closes FROM paper_accounts "
+            f"WHERE strategy IN ({placeholders})", strategies,
+        ).fetchall()
+        positions = self.conn.execute(
+            f"SELECT strategy, token, market, team, qty, entry_price, opened_at, trade_id "
+            f"FROM paper_positions WHERE strategy IN ({placeholders})", strategies,
+        ).fetchall()
+        return (
+            {r["strategy"]: dict(r) for r in accounts},
+            [dict(r) for r in positions],
+        )
+
+    def save_paper_state(self, broker) -> None:
+        """Atomically checkpoint a PaperBroker ledger after every fill."""
+        strategies = list(broker.cash)
+        now = time.time()
+        with self.conn:
+            for strategy in strategies:
+                self.conn.execute(
+                    """INSERT INTO paper_accounts (strategy, cash, realized, closes, updated_at)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(strategy) DO UPDATE SET cash=excluded.cash,
+                           realized=excluded.realized, closes=excluded.closes,
+                           updated_at=excluded.updated_at""",
+                    (strategy, broker.cash[strategy], broker.realized[strategy],
+                     broker.closes[strategy], now),
+                )
+                self.conn.execute("DELETE FROM paper_positions WHERE strategy = ?", (strategy,))
+                self.conn.executemany(
+                    """INSERT INTO paper_positions
+                       (strategy, token, market, team, qty, entry_price, opened_at, trade_id)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    [
+                        (position.strategy, position.token, position.market_key, position.team,
+                         position.qty, position.entry_price, position.opened_at, position.trade_id)
+                        for position in broker.open_positions(strategy)
+                    ],
+                )
+
+    def realized_pnl(self, strategy: str, start: float, end: float) -> float:
+        row = self.conn.execute(
+            """SELECT COALESCE(SUM(pnl_usd), 0) AS pnl FROM trades
+               WHERE strategy = ? AND action = 'CLOSE' AND ts >= ? AND ts < ?""",
+            (strategy, start, end),
+        ).fetchone()
+        return float(row["pnl"])
 
     # --------------------------------------------------------------- summaries
 

@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from polybot.config import Config
 from polybot.engine import Engine
 from polybot.models import GameState, Market
@@ -94,3 +96,27 @@ def test_discovery_only_tracks_matched_markets(tmp_path):
     assert engine.markets["m-yes"].game_pk == 7
     assert "m-no" not in engine.markets
     assert engine.journal.markets_between(0, time.time() + 1)[0].slug == "m-yes"
+
+
+def test_paper_account_restores_after_engine_restart(tmp_path):
+    engine = make_engine(tmp_path)
+    first = engine.broker.open("math", "m1", "m1:LONG", "Homers", 0.50, 10.0)
+    assert first is not None
+    closed = engine.broker.close("math", first.token, 0.60)
+    assert closed is not None
+    second = engine.broker.open("math", "m2", "m2:SHORT", "Awayers", 0.25, 5.0)
+    assert second is not None
+    engine._save_paper_account()
+    engine.journal.close()
+
+    restarted = make_engine(tmp_path)
+    try:
+        assert restarted.broker.cash["math"] == pytest.approx(96.7821782)
+        assert restarted.broker.realized["math"] == pytest.approx(1.7821782)
+        assert restarted.broker.closes["math"] == 1
+        restored = restarted.broker.open_positions("math")
+        assert len(restored) == 1
+        assert restored[0].token == "m2:SHORT"
+        assert "restored paper account" in restarted.events[0]
+    finally:
+        restarted.journal.close()

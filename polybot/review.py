@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
-from datetime import date, datetime, timedelta
-
 from .journal import Journal
 from .models import Market
+from .timeframe import day_bounds
 
 _KNOBS = {
     "no_edge": "strategy.min_edge",
@@ -17,13 +16,6 @@ _KNOBS = {
     "price_band": "strategy.min_price/max_price",
     "early_game": "strategy.early_game_min_edge/fair_extreme",
 }
-
-
-def _day_bounds(day: str | None) -> tuple[float, float, str]:
-    selected = date.today() if day is None else datetime.strptime(day, "%Y-%m-%d").date()
-    start_dt = datetime.combine(selected, datetime.min.time())
-    end_dt = start_dt + timedelta(days=1)
-    return start_dt.timestamp(), end_dt.timestamp(), selected.isoformat()
 
 
 def _fmt_money(value: float | None) -> str:
@@ -277,14 +269,14 @@ def _print_hints(trips: list[dict], near_rows: list[dict], opened_count: int) ->
 
 
 def print_review(db_path: str = "polybot.db", day: str | None = None,
-                 near: float = 0.02) -> None:
-    start, end, label = _day_bounds(day)
+                 near: float = 0.02, timezone: str = "America/Los_Angeles") -> None:
+    start, end, label = day_bounds(day, timezone)
     journal = Journal(db_path)
     try:
         markets = {m.key: m for m in journal.markets_between(start, end)}
         trips = _annotate_trips(journal, journal.round_trips(start, end), markets, end)
         print("=" * 72)
-        print(f"POLYBOT REVIEW {label}")
+        print(f"POLYBOT REVIEW {label} ({timezone})")
         print("=" * 72)
         _print_day_summary(journal, start, end)
         _print_trades(trips)

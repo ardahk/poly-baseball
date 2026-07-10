@@ -50,4 +50,5 @@ engine:
   equity_snapshot_secs: 60
   status_log_interval_secs: 300
   slippage: 0.005
+  report_timezone: America/Los_Angeles # trading-day boundary, not the host timezone
   db_path: polybot.db

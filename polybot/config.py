@@ -71,6 +71,7 @@ class EngineConfig:
     equity_snapshot_secs: float = 60.0
     status_log_interval_secs: float = 300.0
     slippage: float = 0.005              # paper fill: mid +/- this
+    report_timezone: str = "America/Los_Angeles"  # trading-day/report boundary
     live: bool = False
     db_path: str = "polybot.db"
 

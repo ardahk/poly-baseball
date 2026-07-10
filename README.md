@@ -55,6 +55,12 @@ Use `run --dashboard` during a game for a live terminal view of tracked games,
 fresh BBO counts, strategy equity, market state, open positions, and recent
 engine events.
 
+Paper-account cash, positions, and realized P&L persist in `polybot.db` across
+restarts. The dashboard labels its session P&L separately from the persisted
+ledger, and the daily-loss limit uses the configured trading-day boundary
+(`engine.report_timezone`, default `America/Los_Angeles`). Use
+`review --timezone UTC` only when you deliberately want UTC calendar days.
+
 The first command that opens an older `polybot.db` migrates it in place. The
 migration is additive, but copy the DB aside first if it contains data you care
 about:

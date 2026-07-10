@@ -13,6 +13,7 @@ class RiskManager:
     def __init__(self, cfg: RiskConfig, strategies: list[str]):
         self.cfg = cfg
         self.halted: dict[str, bool] = {s: False for s in strategies}
+        self.halted_day: dict[str, str | None] = {s: None for s in strategies}
 
     def can_open(
         self,
@@ -20,15 +21,22 @@ class RiskManager:
         strategy: str,
         market_key: str,
         stake_usd: float | None = None,
+        daily_realized: float | None = None,
+        day_key: str | None = None,
     ) -> bool:
         stake = self.cfg.stake_usd if stake_usd is None else stake_usd
+        if day_key is not None and self.halted_day[strategy] not in {None, day_key}:
+            self.halted[strategy] = False
+            self.halted_day[strategy] = None
         if self.halted[strategy]:
             return False
-        if broker.realized[strategy] <= -self.cfg.daily_loss_limit_usd:
+        realized = broker.realized[strategy] if daily_realized is None else daily_realized
+        if realized <= -self.cfg.daily_loss_limit_usd:
             if not self.halted[strategy]:
                 log.warning("[%s] daily loss limit hit (%.2f) — halting new entries",
-                            strategy, broker.realized[strategy])
+                            strategy, realized)
             self.halted[strategy] = True
+            self.halted_day[strategy] = day_key
             return False
         if len(broker.open_positions(strategy)) >= self.cfg.max_positions:
             return False

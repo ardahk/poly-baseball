@@ -88,6 +88,27 @@ class PaperBroker:
         return sum(p.cost for p in self.positions[strategy].values()
                    if p.market_key == market_key)
 
+    def restore(self, accounts: dict[str, dict], positions: list[Position]) -> bool:
+        """Restore a previously persisted paper ledger.
+
+        Missing strategies deliberately retain their configured starting cash, so
+        enabling a new strategy does not inherit another strategy's account.
+        """
+        restored = False
+        for strategy, state in accounts.items():
+            if strategy not in self.cash:
+                continue
+            self.cash[strategy] = float(state["cash"])
+            self.realized[strategy] = float(state["realized"])
+            self.closes[strategy] = int(state["closes"])
+            restored = True
+        for position in positions:
+            if position.strategy not in self.positions:
+                continue
+            self.positions[position.strategy][position.token] = position
+            restored = True
+        return restored
+
 
 class LiveBroker(PaperBroker):
     """Real orders on Polymarket US via the official `polymarket-us` SDK.

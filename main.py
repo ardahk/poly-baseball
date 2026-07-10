@@ -74,7 +74,10 @@ def cmd_report(args, cfg):
 
 
 def cmd_review(args, cfg):
-    print_review(cfg.engine.db_path, day=args.date, near=args.near)
+    print_review(
+        cfg.engine.db_path, day=args.date, near=args.near,
+        timezone=args.timezone or cfg.engine.report_timezone,
+    )
 
 
 def _fmt_ts(ts):
@@ -100,6 +103,16 @@ def cmd_status(args, cfg):
         print(f"latest game state: {_fmt_ts(status['latest_game_state_ts'])}")
         print(f"trade opens      : {status['trades'].get('OPEN', 0)}")
         print(f"trade closes     : {status['trades'].get('CLOSE', 0)}")
+        accounts, positions = journal.paper_state(["math", "ai"])
+        if accounts:
+            print("persisted paper account:")
+            for strategy, account in sorted(accounts.items()):
+                open_count = sum(1 for pos in positions if pos["strategy"] == strategy)
+                print(
+                    f"  {strategy:<13} cash=${account['cash']:.2f} "
+                    f"realized=${account['realized']:+.2f} "
+                    f"open={open_count} closed={account['closes']}"
+                )
         print("\nRecent priced markets:")
         rows = journal.recent_price_markets()
         if not rows:
@@ -165,6 +178,9 @@ def main():
     sub.add_parser("report", help="print math-vs-AI performance report")
     p_review = sub.add_parser("review", help="review a recorded paper-trading day")
     p_review.add_argument("--date", help="local date to review, YYYY-MM-DD (default: today)")
+    p_review.add_argument(
+        "--timezone", help="IANA timezone for the trading-day boundary (default: config)",
+    )
     p_review.add_argument("--near", type=float, default=0.02,
                           help="near-miss margin window for rejected gates")
     p_bt = sub.add_parser("backtest", help="validate the models on finished games")

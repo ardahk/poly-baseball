@@ -73,17 +73,22 @@ class TerminalDashboard:
             "=" * width,
             self._poll_line(engine, now),
             self._funnel_line(engine),
+            self._account_line(engine),
             "",
             "STRATEGIES",
         ]
         lines.extend(_table(
-            ["name", "equity", "cash", "open", "realized", "closed"],
+            ["name", "equity", "cash", "open", "session", "realized", "closed"],
             [
                 [
                     strat,
                     _money(engine.broker.equity(strat, engine.latest_prices)),
                     _money(engine.broker.cash[strat]),
                     str(len(engine.broker.open_positions(strat))),
+                    _signed_money(
+                        engine.broker.realized.get(strat, 0.0)
+                        - getattr(engine, "session_realized", {}).get(strat, 0.0)
+                    ),
                     _signed_money(engine.broker.realized.get(strat, 0.0)),
                     str(engine.broker.closes.get(strat, 0)),
                 ]
@@ -128,6 +133,12 @@ class TerminalDashboard:
         else:
             lines.append(footer)
         return lines
+
+    @staticmethod
+    def _account_line(engine: Any) -> str:
+        if engine.cfg.engine.live:
+            return "account: live broker ledger"
+        return "account: persisted paper ledger | session P&L begins at this process start"
 
     def _poll_line(self, engine: Any, now: float) -> str:
         discovery_due = max(

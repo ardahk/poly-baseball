@@ -11,8 +11,9 @@ from .broker import LiveBroker, PaperBroker
 from .config import Config
 from .dashboard import TerminalDashboard
 from .journal import Journal
-from .models import GameState, Market, MarketQuote
+from .models import GameState, Market, MarketQuote, Position
 from .risk import RiskManager
+from .timeframe import day_bounds
 from .volatility import PriceHistory
 log = logging.getLogger(__name__)
 
@@ -28,11 +29,19 @@ class Engine:
         if AI not in self.strategies:
             log.info("AI strategy disabled (no ANTHROPIC_API_KEY or ai.enabled=false)")
 
+        self.started_at = time.time()
+        self.dashboard = TerminalDashboard(enabled=dashboard)
+        self.events: deque[str] = deque(maxlen=10)
+
         broker_cls = LiveBroker if cfg.engine.live else PaperBroker
         self.broker = broker_cls(self.strategies, cfg.risk.starting_cash,
                                  cfg.engine.slippage)
-        self.risk = RiskManager(cfg.risk, self.strategies)
         self.journal = Journal(cfg.engine.db_path)
+        if not cfg.engine.live:
+            self._restore_paper_account()
+            self.journal.save_paper_state(self.broker)
+        self.session_realized = dict(self.broker.realized)
+        self.risk = RiskManager(cfg.risk, self.strategies)
         self.mlb = mlb.MLBClient()
 
         self.markets: dict[str, Market] = {}
@@ -47,9 +56,25 @@ class Engine:
         self._last_game_poll = 0.0
         self._last_equity = 0.0
         self._last_status_log = 0.0
-        self.started_at = time.time()
-        self.dashboard = TerminalDashboard(enabled=dashboard)
-        self.events: deque[str] = deque(maxlen=10)
+
+    def _restore_paper_account(self) -> None:
+        accounts, saved_positions = self.journal.paper_state(self.strategies)
+        positions = [
+            Position(
+                strategy=row["strategy"], market_key=row["market"], token=row["token"],
+                team=row["team"], qty=row["qty"], entry_price=row["entry_price"],
+                opened_at=row["opened_at"], trade_id=row["trade_id"],
+            )
+            for row in saved_positions
+        ]
+        if self.broker.restore(accounts, positions):
+            restored_positions = sum(len(self.broker.open_positions(s)) for s in self.strategies)
+            self._event("restored paper account (%d position%s)", restored_positions,
+                        "s" if restored_positions != 1 else "")
+
+    def _save_paper_account(self) -> None:
+        if not self.cfg.engine.live:
+            self.journal.save_paper_state(self.broker)
 
     # ------------------------------------------------------------------ loop
 
@@ -201,6 +226,7 @@ class Engine:
                                   trade_id=position.trade_id, fair=fair,
                                   intended_price=price, slippage=fill - price,
                                   exit_kind=strategy.exit_kind(reason))
+        self._save_paper_account()
         cooldown = self.cfg.strategy.stop_loss_cooldown_secs \
             if reason.startswith("stop loss") else self.cfg.strategy.cooldown_secs
         self.cooldowns[(strat, position.market_key)] = time.time() + cooldown
@@ -245,6 +271,7 @@ class Engine:
     def _look_for_entries(self):
         scfg = self.cfg.strategy
         now = time.time()
+        day_start, day_end, day_key = day_bounds(timezone=self.cfg.engine.report_timezone)
         rows: list[dict] = []
         for market in self.markets.values():
             gs = self.game_states.get(market.game_pk)
@@ -298,7 +325,11 @@ class Engine:
                     ))
                     continue
                 stake = self._stake_for_signal(sig, quote)
-                if not self.risk.can_open(self.broker, strat, market.key, stake):
+                daily_realized = self.journal.realized_pnl(strat, day_start, day_end)
+                if not self.risk.can_open(
+                    self.broker, strat, market.key, stake, daily_realized=daily_realized,
+                    day_key=day_key,
+                ):
                     self._bump("risk_blocked")
                     rows.append(self._decision_row(
                         market, gs, "post_signal", "risk_blocked",
@@ -338,6 +369,7 @@ class Engine:
                                              spread=quote.home_spread,
                                              intended_price=sig.price,
                                              slippage=pos.entry_price - sig.price)
+                    self._save_paper_account()
                 else:
                     rows.append(self._decision_row(
                         market, gs, "post_signal", "open_failed",

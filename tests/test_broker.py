@@ -95,3 +95,18 @@ def test_risk_daily_loss_halts(broker):
     broker.realized["math"] = -6.0
     assert not risk.can_open(broker, "math", "m1")
     assert risk.halted["math"]
+
+
+def test_risk_daily_loss_uses_persisted_day_total_when_given(broker):
+    risk = RiskManager(RiskConfig(daily_loss_limit_usd=5), ["math"])
+    broker.realized["math"] = 20.0  # lifetime P&L is not the daily guard
+
+    assert not risk.can_open(broker, "math", "m1", daily_realized=-6.0)
+    assert risk.halted["math"]
+
+
+def test_risk_daily_halt_resets_on_next_trading_day(broker):
+    risk = RiskManager(RiskConfig(daily_loss_limit_usd=5), ["math"])
+
+    assert not risk.can_open(broker, "math", "m1", daily_realized=-6.0, day_key="2026-07-09")
+    assert risk.can_open(broker, "math", "m1", daily_realized=0.0, day_key="2026-07-10")
