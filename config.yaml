@@ -42,6 +42,23 @@ ai:
   min_confidence: 0.55
   timeout_secs: 20
 
+# Frozen-strategy registry. Each entry gets its own independent shadow portfolio
+# and competes on the same market/game stream. `overrides` patch the `strategy:`
+# block above. `kind: ai_shadow` judges a base strategy's candidates
+# asynchronously (skipped when ai.enabled is false). Delete this block to fall
+# back to the built-in default (fade_v1_frozen + fade_tight + ai_shadow).
+strategies:
+  - name: fade_v1_frozen       # the control: today's strategy config, unchanged
+    kind: fade
+  - name: fade_tight           # cheap config-only variant: stricter move/edge
+    kind: fade
+    overrides:
+      move_threshold: 0.15
+      min_edge: 0.09
+  - name: ai_shadow            # async Claude gate over fade_v1_frozen candidates
+    kind: ai_shadow
+    base: fade_v1_frozen
+
 engine:
   poll_interval_secs: 2
   game_state_interval_secs: 10

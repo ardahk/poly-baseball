@@ -10,19 +10,22 @@ from collections import deque
 from dataclasses import asdict
 
 from . import mlb, pmus, strategy
-from .ai_judge import AIJudge
 from .broker import PaperBroker
 from .config import Config
 from .dashboard import TerminalDashboard
 from .journal import Journal
 from .models import GameState, Market, MarketQuote, Position
 from .risk import RiskManager
+from .strategies import (
+    HORIZONS,
+    StratContext,
+    build_strategies,
+    executable_ask,
+    executable_bid,
+)
 from .timeframe import day_bounds
 from .volatility import PriceHistory
 log = logging.getLogger(__name__)
-
-MATH = "math"
-AI = "ai"
 
 
 class Engine:
@@ -30,10 +33,11 @@ class Engine:
         if cfg.engine.live:
             raise RuntimeError("Live trading is disabled during Phase 0 validation")
         self.cfg = cfg
-        self.judge = AIJudge(cfg.ai)
-        self.strategies = [MATH] + ([AI] if self.judge.available else [])
-        if AI not in self.strategies:
-            log.info("AI strategy disabled (no ANTHROPIC_API_KEY or ai.enabled=false)")
+        # Frozen strategy registry drives the whole loop; `self.strategies` keeps
+        # the plain names that broker / risk / journal are keyed by.
+        self.strategy_objs = build_strategies(cfg)
+        self.strategies = [s.name for s in self.strategy_objs]
+        log.info("strategies: %s", self.strategies)
 
         self.started_at = time.time()
         self.dashboard = TerminalDashboard(enabled=dashboard)
@@ -63,6 +67,9 @@ class Engine:
         self.latest_prices: dict[str, float] = {}          # token -> price
         self.latest_quotes: dict[str, MarketQuote] = {}    # market_key -> latest BBO
         self.funnel: dict[str, int] = {}                   # entry-gate reject counters
+        # Signals awaiting counterfactual snapshots: each is
+        # {signal_id, token, market_key, born, remaining:set[int]}.
+        self.pending_cf: list[dict] = []
 
         self._last_discovery = 0.0
         self._last_game_poll = 0.0
@@ -104,6 +111,7 @@ class Engine:
                 self._poll_prices(quotes)
                 self._manage_exits()
                 self._look_for_entries()
+                self._flush_counterfactuals()
                 self._maybe_snapshot_equity()
                 self._maybe_log_status()
                 self.dashboard.render(self)
@@ -112,6 +120,8 @@ class Engine:
         except KeyboardInterrupt:
             self._event("shutting down")
         finally:
+            for strat in self.strategy_objs:
+                strat.close()
             self.dashboard.close()
             self.journal.close()
 
@@ -247,25 +257,19 @@ class Engine:
     # ----------------------------------------------------------------- exits
 
     def _manage_exits(self):
-        for strat in self.strategies:
-            for pos in self.broker.open_positions(strat):
+        now = time.time()
+        for strat in self.strategy_objs:
+            for pos in self.broker.open_positions(strat.name):
                 market = self.markets.get(pos.market_key)
-                price = self.latest_prices.get(pos.token)
-                if market is None or price is None:
+                if market is None:
                     continue
                 quote = self.latest_quotes.get(market.key)
-                if quote is None or time.time() - quote.ts > self.cfg.strategy.max_quote_age_secs:
+                if quote is None or now - quote.ts > self.cfg.strategy.max_quote_age_secs:
                     continue
                 gs = self.game_states.get(market.game_pk)
-                fair = None
-                if gs:
-                    fair_home = strategy.fair_home_value(gs, self.cfg.strategy)
-                    fair = fair_home if pos.token == market.home_token else 1.0 - fair_home
-                reason = strategy.check_exit(
-                    pos, price, fair, bool(gs and gs.is_final), self.cfg.strategy
-                )
-                if reason:
-                    self._close(strat, pos, price, reason, fair=fair)
+                ctx = StratContext(market, self.histories[market.key], gs, quote, now)
+                for ex in strat.manage(ctx, [pos]):
+                    self._close(strat.name, ex.position, ex.price, ex.reason, fair=ex.fair)
 
     def _close(self, strat: str, pos, price: float, reason: str,
                fair: float | None = None):
@@ -355,111 +359,136 @@ class Engine:
                     ts=now,
                 ))
                 continue
-            ev = strategy.evaluate_entry(market, self.histories[market.key], gs, scfg)
-            self._bump(ev.outcome)
-            rows.append(self._decision_row(
-                market, gs, "strategy", ev.outcome, ev=ev, quote=quote,
-                quote_age=now - quote.ts, ts=now,
-            ))
-            sig = ev.signal
-            if sig is None:
-                continue
-            entry_price = self._entry_price(market, quote, sig.token)
-            executable_edge = sig.fair - entry_price
-            if executable_edge < scfg.min_edge:
-                self._bump("execution_cost")
-                rows.append(self._decision_row(
-                    market, gs, "execution", "execution_cost", ev=ev, quote=quote,
-                    quote_age=now - quote.ts, margin=executable_edge - scfg.min_edge, ts=now,
-                ))
-                continue
-            for strat in self.strategies:
-                if time.time() < self.cooldowns.get((strat, market.key), 0):
-                    self._bump("cooldown")
-                    rows.append(self._decision_row(
-                        market, gs, "post_signal", "cooldown",
-                        strategy_name=strat, ev=ev, quote=quote,
-                        quote_age=now - quote.ts, ts=now,
-                    ))
-                    continue
-                if sig.token in self.broker.positions[strat]:
-                    self._bump("already_open")
-                    rows.append(self._decision_row(
-                        market, gs, "post_signal", "already_open",
-                        strategy_name=strat, ev=ev, quote=quote,
-                        quote_age=now - quote.ts, ts=now,
-                    ))
-                    continue
-                stake = self._stake_for_signal(sig, quote, edge=executable_edge)
-                daily_realized = self.journal.realized_pnl(strat, day_start, day_end)
-                if not self.risk.can_open(
-                    self.broker, strat, market.key, stake, daily_realized=daily_realized,
-                    day_key=day_key,
-                ):
-                    self._bump("risk_blocked")
-                    rows.append(self._decision_row(
-                        market, gs, "post_signal", "risk_blocked",
-                        strategy_name=strat, ev=ev, quote=quote,
-                        quote_age=now - quote.ts, ts=now,
-                    ))
-                    continue
-                reason = f"{sig.reason}; spread {quote.home_spread:.3f}; stake ${stake:.0f}"
-                if strat == AI:
-                    verdict = self.judge.judge(sig, gs)
-                    if not verdict.approve:
-                        self._bump("ai_rejected")
-                        rows.append(self._decision_row(
-                            market, gs, "post_signal", "ai_rejected",
-                            strategy_name=strat, ev=ev, quote=quote,
-                            quote_age=now - quote.ts, ts=now,
-                        ))
-                        self._event("[ai] rejected %s: %s", sig.side_team, verdict.reason)
-                        self.cooldowns[(AI, market.key)] = time.time() + scfg.cooldown_secs
-                        continue
-                    reason += f" | ai: {verdict.reason} ({verdict.confidence:.2f})"
-                pos = self.broker.open(strat, market.key, sig.token, sig.side_team,
-                                       entry_price, stake)
-                if pos:
-                    self._bump("opened")
-                    rows.append(self._decision_row(
-                        market, gs, "post_signal", "opened",
-                        strategy_name=strat, ev=ev, quote=quote,
-                        quote_age=now - quote.ts, ts=now,
-                    ))
-                    self._event("[%s] OPEN %s @ %.3f - %s",
-                                strat, sig.side_team, pos.entry_price, reason)
-                    with self.journal.conn:
-                        self.journal.record_open(strat, market.key, sig.side_team,
-                                                 sig.token, pos.qty, pos.entry_price, reason,
-                                                 trade_id=pos.trade_id, fair=sig.fair,
-                                                 edge=executable_edge, move=sig.move,
-                                                 spread=quote.home_spread,
-                                                 intended_price=entry_price,
-                                                 slippage=pos.entry_price - entry_price,
-                                                 fee_usd=self.broker.last_fee[strat], commit=False)
-                        self.journal.save_paper_state(self.broker, commit=False)
-                else:
-                    rows.append(self._decision_row(
-                        market, gs, "post_signal", "open_failed",
-                        strategy_name=strat, ev=ev, quote=quote,
-                        quote_age=now - quote.ts, ts=now,
-                    ))
+            ctx = StratContext(market, self.histories[market.key], gs, quote, now)
+            for strat in self.strategy_objs:
+                self._evaluate_strategy(strat, ctx, gs, quote, now,
+                                        day_start, day_end, day_key, rows)
         self.journal.record_decisions(rows)
+
+    def _evaluate_strategy(self, strat, ctx, gs, quote, now,
+                           day_start, day_end, day_key, rows):
+        market = ctx.market
+        d = strat.evaluate(ctx)
+        self._bump(d.outcome)
+        ev = d.evaluation or (d.intent.evaluation if d.intent else None)
+        rows.append(self._decision_row(
+            market, gs, "strategy", d.outcome, strategy_name=strat.name,
+            ev=ev, quote=quote, quote_age=now - quote.ts, ts=now,
+        ))
+        if d.signal_candidate and ev is not None and ev.signal is not None:
+            self._register_signal(strat.name, ctx, ev)
+
+        intent = d.intent
+        if intent is None:
+            return
+        if time.time() < self.cooldowns.get((strat.name, market.key), 0):
+            self._bump("cooldown")
+            rows.append(self._decision_row(
+                market, gs, "post_signal", "cooldown", strategy_name=strat.name,
+                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+            return
+        if intent.token in self.broker.positions[strat.name]:
+            self._bump("already_open")
+            rows.append(self._decision_row(
+                market, gs, "post_signal", "already_open", strategy_name=strat.name,
+                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+            return
+        stake = self._stake_for_intent(intent, quote)
+        daily_realized = self.journal.realized_pnl(strat.name, day_start, day_end)
+        if not self.risk.can_open(
+            self.broker, strat.name, market.key, stake,
+            daily_realized=daily_realized, day_key=day_key,
+        ):
+            self._bump("risk_blocked")
+            rows.append(self._decision_row(
+                market, gs, "post_signal", "risk_blocked", strategy_name=strat.name,
+                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+            return
+        entry_price = ctx.entry_price(intent.token)
+        reason = f"{intent.reason}; spread {quote.home_spread:.3f}; stake ${stake:.0f}"
+        pos = self.broker.open(strat.name, market.key, intent.token,
+                               intent.side_team, entry_price, stake)
+        if pos:
+            self._bump("opened")
+            rows.append(self._decision_row(
+                market, gs, "post_signal", "opened", strategy_name=strat.name,
+                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+            self._event("[%s] OPEN %s @ %.3f - %s",
+                        strat.name, intent.side_team, pos.entry_price, reason)
+            with self.journal.conn:
+                self.journal.record_open(strat.name, market.key, intent.side_team,
+                                         intent.token, pos.qty, pos.entry_price, reason,
+                                         trade_id=pos.trade_id, fair=intent.fair,
+                                         edge=intent.edge, move=intent.move,
+                                         spread=quote.home_spread,
+                                         intended_price=entry_price,
+                                         slippage=pos.entry_price - entry_price,
+                                         fee_usd=self.broker.last_fee[strat.name],
+                                         commit=False)
+                self.journal.save_paper_state(self.broker, commit=False)
+        else:
+            rows.append(self._decision_row(
+                market, gs, "post_signal", "open_failed", strategy_name=strat.name,
+                ev=ev, quote=quote, quote_age=now - quote.ts, ts=now))
+
+    def _register_signal(self, strat_name: str, ctx: StratContext, ev) -> None:
+        """Log a signal-grade candidate and queue its counterfactual horizons."""
+        sig = ev.signal
+        sid = self.journal.record_signal(
+            strategy=strat_name, market=ctx.market.key, token=sig.token,
+            side_team=ev.side_team, entry_price=ctx.entry_price(sig.token),
+            fair=ev.fair, edge=ev.edge, move=ev.move, spread=ctx.quote.home_spread,
+            inning=ctx.game_state.inning, is_top=int(ctx.game_state.is_top),
+            home_score=ctx.game_state.home_score, away_score=ctx.game_state.away_score,
+            commit=False,
+        )
+        self.pending_cf.append({
+            "signal_id": sid, "token": sig.token, "market_key": ctx.market.key,
+            "born": ctx.now, "remaining": set(HORIZONS),
+        })
+
+    def _flush_counterfactuals(self):
+        """Snapshot each pending signal's executable price at every elapsed horizon."""
+        now = time.time()
+        still: list[dict] = []
+        dirty = False
+        for sig in self.pending_cf:
+            due = sorted(h for h in sig["remaining"] if now - sig["born"] >= h)
+            for horizon in due:
+                market = self.markets.get(sig["market_key"])
+                quote = self.latest_quotes.get(sig["market_key"])
+                fresh = quote is not None and \
+                    now - quote.ts <= self.cfg.strategy.max_quote_age_secs
+                if market is not None and fresh:
+                    bid = executable_bid(market, quote, sig["token"])
+                    ask = executable_ask(market, quote, sig["token"])
+                    self.journal.record_counterfactual(
+                        sig["signal_id"], horizon, exec_bid=bid, exec_ask=ask,
+                        mid=(bid + ask) / 2, two_sided=1, spread=ask - bid,
+                        commit=False)
+                else:
+                    hist = self.histories.get(sig["market_key"])
+                    self.journal.record_counterfactual(
+                        sig["signal_id"], horizon, exec_bid=None, exec_ask=None,
+                        mid=hist.last if hist else None, two_sided=0, spread=None,
+                        commit=False)
+                dirty = True
+            sig["remaining"].difference_update(due)
+            if sig["remaining"]:
+                still.append(sig)
+        self.pending_cf = still
+        if dirty:
+            self.journal.conn.commit()
 
     @staticmethod
     def _entry_price(market: Market, quote: MarketQuote, token: str) -> float:
         """Executable taker buy price for a normalized token side."""
-        if token == market.home_token:
-            return quote.home_ask
-        if token == market.away_token:
-            return 1.0 - quote.home_bid
-        raise ValueError(f"token {token!r} does not belong to market {market.key!r}")
+        return executable_ask(market, quote, token)
 
-    def _stake_for_signal(self, sig, quote: MarketQuote, edge: float | None = None) -> float:
+    def _stake_for_intent(self, intent, quote: MarketQuote) -> float:
         rcfg = self.cfg.risk
         scfg = self.cfg.strategy
-        executable_edge = sig.edge if edge is None else edge
-        if executable_edge >= rcfg.strong_stake_min_edge \
+        if intent.edge >= rcfg.strong_stake_min_edge \
                 and quote.home_spread <= scfg.strong_stake_max_spread:
             return rcfg.strong_stake_usd
         return rcfg.stake_usd

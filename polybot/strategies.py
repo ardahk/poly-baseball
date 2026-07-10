@@ -21,6 +21,24 @@ from .volatility import PriceHistory
 HORIZONS = (5, 15, 30, 60, 120, 300)
 
 
+def executable_ask(market: Market, quote: MarketQuote, token: str) -> float:
+    """Executable taker BUY price for a token side (ask). Single source of truth."""
+    if token == market.home_token:
+        return quote.home_ask
+    if token == market.away_token:
+        return 1.0 - quote.home_bid
+    raise ValueError(f"token {token!r} not in market {market.key!r}")
+
+
+def executable_bid(market: Market, quote: MarketQuote, token: str) -> float:
+    """Executable taker SELL price for a token side (bid). Single source of truth."""
+    if token == market.home_token:
+        return quote.home_bid
+    if token == market.away_token:
+        return 1.0 - quote.home_ask
+    raise ValueError(f"token {token!r} not in market {market.key!r}")
+
+
 @dataclass
 class StratContext:
     """The shared market/game observation every strategy decides against."""
@@ -31,20 +49,10 @@ class StratContext:
     now: float
 
     def entry_price(self, token: str) -> float:
-        """Executable taker BUY price for a token side (ask)."""
-        if token == self.market.home_token:
-            return self.quote.home_ask
-        if token == self.market.away_token:
-            return 1.0 - self.quote.home_bid
-        raise ValueError(f"token {token!r} not in market {self.market.key!r}")
+        return executable_ask(self.market, self.quote, token)
 
     def exit_price(self, token: str) -> float:
-        """Executable taker SELL price for a token side (bid)."""
-        if token == self.market.home_token:
-            return self.quote.home_bid
-        if token == self.market.away_token:
-            return 1.0 - self.quote.home_ask
-        raise ValueError(f"token {token!r} not in market {self.market.key!r}")
+        return executable_bid(self.market, self.quote, token)
 
 
 @dataclass

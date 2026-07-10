@@ -84,13 +84,14 @@ def test_quote_keeps_gateway_receipt_and_source_times(tmp_path):
 def test_final_game_settles_paper_position_at_official_outcome(tmp_path):
     engine = make_engine(tmp_path)
     market = tracked_market(engine)
-    pos = engine.broker.open("math", market.key, market.home_token, market.home_team, 0.50, 10.0)
+    pos = engine.broker.open("fade_v1_frozen", market.key, market.home_token,
+                             market.home_team, 0.50, 10.0)
     assert pos is not None
 
     engine._settle_final_game(GameState(1, home_score=4, away_score=3, status="Final"))
 
-    assert engine.broker.open_positions("math") == []
-    assert engine.broker.realized["math"] == pytest.approx(9.70)
+    assert engine.broker.open_positions("fade_v1_frozen") == []
+    assert engine.broker.realized["fade_v1_frozen"] == pytest.approx(9.70)
     close = engine.journal.recent_trades(1)[0]
     assert close[2] == "CLOSE"
     assert "official game settlement" in close[-1]
@@ -168,23 +169,53 @@ def test_discovery_only_tracks_matched_markets(tmp_path):
 
 def test_paper_account_restores_after_engine_restart(tmp_path):
     engine = make_engine(tmp_path)
-    first = engine.broker.open("math", "m1", "m1:LONG", "Homers", 0.50, 10.0)
+    first = engine.broker.open("fade_v1_frozen", "m1", "m1:LONG", "Homers", 0.50, 10.0)
     assert first is not None
-    closed = engine.broker.close("math", first.token, 0.60)
+    closed = engine.broker.close("fade_v1_frozen", first.token, 0.60)
     assert closed is not None
-    second = engine.broker.open("math", "m2", "m2:SHORT", "Awayers", 0.25, 5.0)
+    second = engine.broker.open("fade_v1_frozen", "m2", "m2:SHORT", "Awayers", 0.25, 5.0)
     assert second is not None
     engine._save_paper_account()
     engine.journal.close()
 
     restarted = make_engine(tmp_path)
     try:
-        assert restarted.broker.cash["math"] == pytest.approx(96.19)
-        assert restarted.broker.realized["math"] == pytest.approx(1.41)
-        assert restarted.broker.closes["math"] == 1
-        restored = restarted.broker.open_positions("math")
+        assert restarted.broker.cash["fade_v1_frozen"] == pytest.approx(96.19)
+        assert restarted.broker.realized["fade_v1_frozen"] == pytest.approx(1.41)
+        assert restarted.broker.closes["fade_v1_frozen"] == 1
+        restored = restarted.broker.open_positions("fade_v1_frozen")
         assert len(restored) == 1
         assert restored[0].token == "m2:SHORT"
         assert "restored paper account" in restarted.events[0]
     finally:
         restarted.journal.close()
+
+
+def test_engine_runs_multiple_frozen_strategies(tmp_path):
+    engine = make_engine(tmp_path)
+    assert "fade_v1_frozen" in engine.strategies
+    assert "fade_tight" in engine.strategies
+    assert set(engine.broker.cash) == set(engine.strategies)
+
+
+def test_counterfactuals_recorded_after_horizon(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    engine.latest_quotes[market.key] = MarketQuote(market.key, 0.50, 0.52, 0.50, 0.52)
+    engine.histories[market.key].add(0.51)
+    sid = engine.journal.record_signal(
+        strategy="fade_v1_frozen", market=market.key, token=market.home_token,
+        side_team="Homers", entry_price=0.52, fair=0.6, edge=0.08, move=-0.1,
+        spread=0.02, inning=7, is_top=1, home_score=4, away_score=1)
+    engine.pending_cf.append({"signal_id": sid, "token": market.home_token,
+                              "market_key": market.key, "born": time.time() - 31,
+                              "remaining": {30}})
+
+    engine._flush_counterfactuals()
+
+    row = engine.journal.conn.execute(
+        "SELECT * FROM signal_counterfactuals WHERE signal_id=?", (sid,)).fetchone()
+    assert row["horizon_secs"] == 30
+    assert row["exec_ask"] == 0.52
+    assert row["two_sided"] == 1
+    assert engine.pending_cf == []

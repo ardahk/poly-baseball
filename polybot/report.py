@@ -1,4 +1,4 @@
-"""Performance report: math vs AI strategy comparison."""
+"""Performance report: frozen-strategy comparison across shadow portfolios."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -12,7 +12,7 @@ def print_report(db_path: str = "polybot.db", starting_cash: float = 100.0) -> N
     equity = dict(journal.latest_equity())
 
     print("=" * 68)
-    print("POLYBOT PERFORMANCE — math vs AI")
+    print("POLYBOT PERFORMANCE — frozen strategies")
     print("=" * 68)
     if not stats and not equity:
         print("No trades recorded yet.")
