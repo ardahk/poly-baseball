@@ -72,5 +72,7 @@ engine:
   status_log_interval_secs: 300
   slippage: 0.0                 # runtime fills use executable BBO; legacy replay only
   paper_taker_fee_theta: 0.06   # Polymarket US taker fee coefficient
+  causal_replay_latency_secs: 0.5 # first eligible BBO after decision + latency
+  history_gap_reset_secs: 180     # reset rolling signals after an observation gap
   report_timezone: America/Los_Angeles # trading-day boundary, not the host timezone
   db_path: polybot.db

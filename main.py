@@ -21,7 +21,7 @@ import logging
 import sys
 from datetime import datetime
 
-from polybot import backtest, mlb, pmus
+from polybot import backtest, causal_replay, mlb, pmus
 from polybot.config import load_config
 from polybot.engine import Engine
 from polybot.journal import Journal
@@ -148,7 +148,10 @@ def cmd_backtest(args, cfg):
     elif args.mode == "strategy":
         backtest.strategy_backtest(cfg, days_back=args.days, max_games=args.max_games)
     else:
-        backtest.strategy_replay_db(cfg, db_path=cfg.engine.db_path, day=args.date)
+        report = causal_replay.replay_recorded_day(
+            cfg, db_path=cfg.engine.db_path, day=args.date
+        )
+        causal_replay.print_report(report)
 
 
 def main():
@@ -179,7 +182,7 @@ def main():
     p_review.add_argument("--near", type=float, default=0.02,
                           help="near-miss margin window for rejected gates")
     p_bt = sub.add_parser("backtest", help="validate the models on finished games")
-    p_bt.add_argument("mode", choices=["calibrate", "strategy", "replay"])
+    p_bt.add_argument("mode", choices=["calibrate", "strategy", "replay", "causal"])
     p_bt.add_argument("--days", type=int, default=3, help="days back to include")
     p_bt.add_argument("--max-games", type=int, default=40)
     p_bt.add_argument("--date", help="recorded local day for replay, YYYY-MM-DD")

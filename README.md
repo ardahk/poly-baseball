@@ -40,7 +40,7 @@ python main.py run --live    # intentionally disabled during Phase 0
 
 python main.py backtest calibrate --days 7   # is the win-prob formula accurate?
 python main.py backtest strategy  --days 1   # would the trading logic have profited?
-python main.py backtest replay --date 2026-07-08 --set strategy.stop_loss=0.15
+python main.py backtest causal --date 2026-07-08
 ```
 
 Run it during live MLB games (evenings US time); outside game hours there is
@@ -113,11 +113,12 @@ Two ways to validate the math on **real finished games** before risking money:
   proxy. Treat any strategy P&L as a directional sanity check on thresholds,
   not a promise. Your real strategy track record accumulates in `report` as
   you paper-trade.
-- **`backtest replay`** — replays the bot's own recorded SQLite day using the
-  observed tick stream, including one-sided mark prices for move detection and
-  a fresh two-sided-BBO gate for entries. Repeat `--set section.key=value` to
-  sweep thresholds without editing `config.yaml`, for example
-  `python main.py backtest replay --date 2026-07-08 --set strategy.stop_loss=0.15`.
+- **`backtest causal`** (and the legacy `replay` alias) — merges every recorded
+  quote and MLB state onto one receipt-time clock across all games. Decisions
+  can fill only on a later executable BBO after configured latency; fees,
+  overlapping cash/position limits, run boundaries, data gaps, cooldowns, and
+  official settlement are enforced portfolio-wide. Async AI shadows are skipped
+  because external model calls are not deterministic historical evidence.
 
 ## How it works
 

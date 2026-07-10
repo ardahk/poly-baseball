@@ -81,6 +81,19 @@ def test_quote_keeps_gateway_receipt_and_source_times(tmp_path):
     assert tick["source_ts"] == 1233.0
 
 
+def test_price_history_resets_after_data_gap(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    engine.histories[market.key].add(0.60, ts=1000.0)
+
+    engine._poll_prices({market.slug: BookQuote(
+        long_bid=0.39, long_ask=0.41, long_last=0.40, received_at=1200.0,
+    )})
+
+    assert list(engine.histories[market.key].samples) == [(1200.0, 0.40)]
+    assert any("history reset after data gap" in event for event in engine.events)
+
+
 def test_final_game_settles_paper_position_at_official_outcome(tmp_path):
     engine = make_engine(tmp_path)
     market = tracked_market(engine)

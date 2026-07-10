@@ -275,6 +275,13 @@ class Engine:
             book = quotes.get(market.slug)
             if book is None:
                 continue
+            history = self.histories[market.key]
+            if history.samples and book.received_at - history.samples[-1][0] \
+                    > self.cfg.engine.history_gap_reset_secs:
+                self.histories[market.key] = PriceHistory(self.cfg.strategy.flip_band)
+                history = self.histories[market.key]
+                self.latest_quotes.pop(market.key, None)
+                self._event("history reset after data gap: %s", market.question)
             if book.two_sided:
                 quote = self._to_home_quote(market, book)
                 self.journal.record_price(market, quote, commit=False)
@@ -297,7 +304,7 @@ class Engine:
             else:
                 self.latest_quotes.pop(market.key, None)
                 continue
-            self.histories[market.key].add(home_mid)
+            history.add(home_mid, ts=book.received_at)
             wrote = True
         if wrote:
             self.journal.conn.commit()

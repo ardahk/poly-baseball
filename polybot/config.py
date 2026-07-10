@@ -76,6 +76,8 @@ class EngineConfig:
     status_log_interval_secs: float = 300.0
     slippage: float = 0.0                # legacy backtest-only additive fill adjustment
     paper_taker_fee_theta: float = 0.06  # Polymarket US fee coefficient, effective 2026-07
+    causal_replay_latency_secs: float = 0.5  # fill on first BBO observed after this delay
+    history_gap_reset_secs: float = 180.0    # discard rolling features after data outages
     report_timezone: str = "America/Los_Angeles"  # trading-day/report boundary
     live: bool = False
     db_path: str = "polybot.db"
