@@ -7,6 +7,7 @@ preserves concurrent portfolio constraints and prevents future-state leakage.
 """
 from __future__ import annotations
 
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,11 @@ from .strategies import (
 from .timeframe import day_bounds
 from .state_model import load_probability_model
 from .volatility import PriceHistory
+
+# Game states are seeded this far before a window begins so games already in
+# progress replay correctly. Anything the replay consumes must be covered by
+# walkforward.tape_digest, which imports this constant.
+PREGAME_STATE_LOOKBACK_SECS = 6 * 3600
 
 
 @dataclass(order=True)
@@ -80,7 +86,8 @@ class StrategyResult:
     filled_entries: int
     rejected_entries: int
     rejected_exits: int
-    deployed_capital: float
+    deployed_capital: float      # cumulative entry cost (turnover)
+    peak_deployed: float         # max concurrent capital at risk
 
 
 @dataclass
@@ -139,14 +146,17 @@ class CausalReplay:
         self.rejected_entries: dict[str, int] = defaultdict(int)
         self.rejected_exits: dict[str, int] = defaultdict(int)
         self.deployed_capital: dict[str, float] = defaultdict(float)
+        self.open_cost: dict[str, float] = defaultdict(float)
+        self.peak_deployed: dict[str, float] = defaultdict(float)
         self.peak = {name: cfg.risk.starting_cash for name in names}
         self.max_drawdown = {name: 0.0 for name in names}
         self.current_source_run: str | None = None
         self.run_boundaries = 0
 
     def run(self) -> ReplayReport:
-        events = self._load_events()
-        for event in events:
+        events = 0
+        for event in self._iter_events():
+            events += 1
             self._handle_run_boundary(event.run_id)
             if event.kind == "state":
                 self._on_state(event)
@@ -172,51 +182,52 @@ class CausalReplay:
                 rejected_entries=self.rejected_entries[name],
                 rejected_exits=self.rejected_exits[name],
                 deployed_capital=self.deployed_capital[name],
+                peak_deployed=self.peak_deployed[name],
             ))
             strat.close()
         return ReplayReport(
             label=self.label, timezone=self.cfg.engine.report_timezone,
-            events=len(events), run_boundaries=self.run_boundaries,
+            events=events, run_boundaries=self.run_boundaries,
             skipped_strategies=self.skipped, trades=self.trades, results=results,
             starting_cash=self.cfg.risk.starting_cash,
             state_model=self.state_model_label,
         )
 
-    def _load_events(self) -> list[TapeEvent]:
-        events: list[TapeEvent] = []
-        seq = 0
+    def _iter_events(self):
+        """Merge the two receipt-time-ordered streams lazily.
+
+        A 28-day walk-forward window can hold millions of ticks; streaming the
+        cursors through heapq.merge avoids materializing the whole tape.
+        """
         market_keys = set(self.markets)
-        price_rows = self.journal.conn.execute(
+        game_ids = set(self.by_game)
+        price_cursor = self.journal.conn.execute(
             """SELECT rowid AS rid, * FROM price_ticks
                WHERE COALESCE(received_at, ts) >= ? AND COALESCE(received_at, ts) < ?
                ORDER BY COALESCE(received_at, ts), rowid""",
             (self.start, self.end),
-        ).fetchall()
-        for row in price_rows:
-            if row["market"] not in market_keys:
-                continue
-            seq += 1
-            events.append(TapeEvent(
-                ts=row["received_at"] or row["ts"], priority=1, seq=seq,
-                kind="price", run_id=row["run_id"], payload=dict(row),
-            ))
-        game_ids = set(self.by_game)
-        state_rows = self.journal.conn.execute(
+        )
+        state_cursor = self.journal.conn.execute(
             """SELECT rowid AS rid, * FROM game_states
                WHERE COALESCE(received_at, ts) >= ? AND COALESCE(received_at, ts) < ?
                ORDER BY COALESCE(received_at, ts), rowid""",
-            (self.start - 6 * 3600, self.end),
-        ).fetchall()
-        for row in state_rows:
-            if row["game_pk"] not in game_ids:
-                continue
-            seq += 1
-            events.append(TapeEvent(
-                ts=row["received_at"] or row["ts"], priority=0, seq=seq,
-                kind="state", run_id=row["run_id"], payload=dict(row),
-            ))
-        events.sort()
-        return events
+            (self.start - PREGAME_STATE_LOOKBACK_SECS, self.end),
+        )
+
+        def stream(cursor, kind, priority, keep):
+            for seq, row in enumerate(cursor):
+                if not keep(row):
+                    continue
+                yield TapeEvent(
+                    ts=row["received_at"] or row["ts"], priority=priority,
+                    seq=seq, kind=kind, run_id=row["run_id"], payload=dict(row),
+                )
+
+        yield from heapq.merge(
+            stream(state_cursor, "state", 0, lambda r: r["game_pk"] in game_ids),
+            stream(price_cursor, "price", 1, lambda r: r["market"] in market_keys),
+            key=lambda event: (event.ts, event.priority),
+        )
 
     def _handle_run_boundary(self, run_id: str | None) -> None:
         if run_id is None:
@@ -399,6 +410,10 @@ class CausalReplay:
         pos.opened_at = now
         self.filled_entries[strat.name] += 1
         self.deployed_capital[strat.name] += pos.cost
+        self.open_cost[strat.name] += pos.cost
+        self.peak_deployed[strat.name] = max(
+            self.peak_deployed[strat.name], self.open_cost[strat.name],
+        )
         self.open_meta[pos.trade_id] = {
             "entry_ts": now, "entry_fee": pos.entry_fee,
             "entry_spread": quote.home_spread, "entry_inning": gs.inning,
@@ -425,6 +440,9 @@ class CausalReplay:
 
     def _finish_trade(self, position, fill: float, pnl: float, ts: float,
                       reason: str, exit_fee: float) -> None:
+        self.open_cost[position.strategy] = max(
+            0.0, self.open_cost[position.strategy] - position.cost,
+        )
         meta = self.open_meta.pop(position.trade_id, {
             "entry_ts": position.opened_at, "entry_fee": position.entry_fee,
             "entry_spread": 0.0, "entry_inning": 0,

@@ -173,14 +173,23 @@ config hash, code revision, timezone, exact boundaries, and a hash of every
 market/game event in scope. Existing manifests are never overwritten.
 
 `walk-forward evaluate` refuses to run if the manifest, config, or event tape
-changed. Within each fold it selects the strategy with the best validation net
-P&L before evaluating the locked test. The write-once result includes after-cost
-P&L, return on deployed capital, drawdown, daily expected shortfall, fill/fee
-rates, executable-bid adverse selection at 5, 15, 30, and 60 seconds,
-game-clustered calibration losses and confidence intervals, day/game P&L
-confidence intervals, and concentration by day, game, inning, entry-price
-bucket, and spread bucket. Promotion checks apply only to the strategy selected
-before each locked test; challenger results remain visible for auditability.
+changed, and each preregistration can be evaluated exactly once: a completed
+reveal is recorded in the journal, so re-running with a different output path
+is refused rather than silently re-revealing the locked test. Within each fold
+it selects the strategy with the best validation *realized* P&L (closed round
+trips and settlements, net of fees — unrealized marks at a stale bid cannot
+crown a champion) before evaluating the locked test, and records how many
+candidates competed so selection multiplicity is visible in the evidence. The
+write-once result includes after-cost P&L, return on peak deployed capital,
+turnover, drawdown, daily expected shortfall, fill/fee rates, executable-bid
+adverse selection at 5, 15, 30, and 60 seconds, game-clustered calibration
+losses and confidence intervals, day/game P&L confidence intervals, and
+concentration by day, game, inning, entry-price bucket, and spread bucket.
+Promotion additionally requires day- and game-concentration limits and — by
+default — that every fold selected the same champion, since only one strategy
+can go live. Train windows exist to establish liveness; they skip the
+execution-quality extras (adverse selection, calibration) that only matter for
+validation and the locked test.
 
 ## How it works
 

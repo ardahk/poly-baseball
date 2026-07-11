@@ -5,11 +5,10 @@ import logging
 import time
 import hashlib
 import json
-import os
 from collections import deque
 from dataclasses import asdict
 
-from . import mlb, pmus, strategy
+from . import mlb, pmus, provenance, strategy
 from .broker import PaperBroker
 from .config import Config
 from .dashboard import TerminalDashboard
@@ -54,11 +53,8 @@ class Engine:
             taker_fee_theta=cfg.engine.paper_taker_fee_theta,
         )
         self.journal = Journal(cfg.engine.db_path)
-        config_hash = hashlib.sha256(
-            json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
         self.run_id = self.journal.start_run(
-            "paper", config_hash, os.environ.get("POLYBOT_CODE_REVISION", "unknown")
+            "paper", provenance.config_hash(cfg), provenance.code_revision()
         )
         self._record_strategy_registry()
         self.risk = RiskManager(cfg.risk, self.strategies)

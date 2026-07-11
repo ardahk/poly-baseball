@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .model_features import state_signature
 from .models import GameState
+from .provenance import canonical
 from .winprob import home_win_probability
 
 ARTIFACT_VERSION = 1
@@ -102,9 +103,7 @@ class EmpiricalStateModel:
 
     def save(self, path: str | Path) -> str:
         body = self.to_dict()
-        payload = json.dumps(body, sort_keys=True, separators=(",", ":"),
-                             allow_nan=False)
-        digest = hashlib.sha256(payload.encode()).hexdigest()
+        digest = hashlib.sha256(canonical(body).encode()).hexdigest()
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps({**body, "sha256": digest}, indent=2) + "\n")
@@ -118,9 +117,7 @@ class EmpiricalStateModel:
         if data.get("model") != "empirical_state_v1" or not isinstance(data.get("cells"), dict):
             raise ValueError("invalid empirical state-model artifact")
         supplied = data.pop("sha256", None)
-        canonical = json.dumps(data, sort_keys=True, separators=(",", ":"),
-                               allow_nan=False)
-        actual = hashlib.sha256(canonical.encode()).hexdigest()
+        actual = hashlib.sha256(canonical(data).encode()).hexdigest()
         if supplied != actual:
             raise ValueError("state-model artifact checksum mismatch")
         prior_strength = float(data.get("prior_strength", 30.0))

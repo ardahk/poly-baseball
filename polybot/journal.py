@@ -225,6 +225,18 @@ CREATE TABLE IF NOT EXISTS model_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_model_observations_market_ts
     ON model_observations (market, ts);
+CREATE INDEX IF NOT EXISTS idx_model_observations_ts ON model_observations (ts);
+CREATE INDEX IF NOT EXISTS idx_price_ticks_ts ON price_ticks (ts);
+CREATE INDEX IF NOT EXISTS idx_price_ticks_clock
+    ON price_ticks (COALESCE(received_at, ts));
+CREATE INDEX IF NOT EXISTS idx_game_states_clock
+    ON game_states (COALESCE(received_at, ts));
+CREATE TABLE IF NOT EXISTS walk_forward_evaluations (
+    manifest_sha256 TEXT PRIMARY KEY,
+    evaluated_at REAL NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    output_path TEXT NOT NULL
+);
 """
 
 _TRADE_V2_COLUMNS = {
@@ -878,6 +890,25 @@ class Journal:
             )
             for r in rows
         ]
+
+    def walk_forward_evaluation(self, manifest_sha256: str):
+        """Prior completed reveal of this preregistration, or None."""
+        return self.conn.execute(
+            "SELECT * FROM walk_forward_evaluations WHERE manifest_sha256 = ?",
+            (manifest_sha256,),
+        ).fetchone()
+
+    def record_walk_forward_evaluation(self, manifest_sha256: str,
+                                       result_sha256: str, output_path: str,
+                                       ts: float | None = None) -> None:
+        self.conn.execute(
+            """INSERT INTO walk_forward_evaluations
+               (manifest_sha256, evaluated_at, result_sha256, output_path)
+               VALUES (?,?,?,?)""",
+            (manifest_sha256, time.time() if ts is None else ts,
+             result_sha256, output_path),
+        )
+        self.conn.commit()
 
     def markets_between(self, start: float, end: float) -> list[Market]:
         rows = self.conn.execute(

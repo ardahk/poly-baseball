@@ -4,55 +4,59 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import random
 import statistics
-import subprocess
-from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .causal_replay import CausalReplay
+from .causal_replay import PREGAME_STATE_LOOKBACK_SECS, CausalReplay
 from .config import Config
 from .journal import Journal
+from .provenance import canonical, code_identity, config_hash, digest
 from .state_model import brier_loss, clamp_probability, log_loss
 
 FORMAT_VERSION = 1
 HORIZONS = (5, 15, 30, 60)
 TRAIN_DAYS, VALIDATE_DAYS, TEST_DAYS, ROLL_DAYS = 28, 7, 7, 7
 
+# Single source for promotion defaults; main.py's CLI flags reference these.
+DEFAULT_PROMOTION_RULES = {
+    "min_round_trips": 300,
+    "min_trading_days": 30,
+    "min_games": 100,
+    "min_positive_test_folds": 2,
+    "require_positive_net_pnl": True,
+    "require_positive_game_cluster_ci_low": True,
+    "require_consistent_champion": True,
+    "max_top_day_profit_share": 0.35,
+    "max_top_game_profit_share": 0.35,
+}
 
-def _canonical(value: dict) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
-def _digest(value: dict) -> str:
-    return hashlib.sha256(_canonical(value).encode()).hexdigest()
-
-
-def _config_hash(cfg: Config) -> str:
-    return _digest(asdict(cfg))
-
-
-def _code_identity() -> tuple[str, str]:
-    root = Path(__file__).resolve().parent.parent
-    override = os.environ.get("POLYBOT_CODE_REVISION")
-    if override:
-        revision = override
-    else:
-        try:
-            revision = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=root, text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except (OSError, subprocess.CalledProcessError):
-            revision = "unknown"
-    hasher = hashlib.sha256()
-    for path in sorted([root / "main.py", *root.joinpath("polybot").glob("*.py")]):
-        hasher.update(str(path.relative_to(root)).encode())
-        hasher.update(path.read_bytes())
-    return revision, hasher.hexdigest()
+# Every table/column the causal replay or calibration consumes. Pinned
+# explicitly so an additive schema migration does not flip data_version and
+# spuriously invalidate a locked preregistration.
+_TAPE_COLUMNS = {
+    "price_ticks": (
+        "ts", "market", "home_team", "away_team", "home_bid", "home_ask",
+        "home_mid", "home_spread", "long_bid", "long_ask", "two_sided",
+        "source", "run_id", "received_at", "source_ts",
+    ),
+    "game_states": (
+        "ts", "game_pk", "inning", "is_top", "outs", "home_score",
+        "away_score", "on_first", "on_second", "on_third", "status",
+        "run_id", "received_at",
+    ),
+    "model_observations": (
+        "ts", "run_id", "model", "market", "game_pk", "state_signature",
+        "model_home", "pregame_anchor", "anchored_fair", "home_mid", "spread",
+        "inning", "is_top", "outs", "home_score", "away_score",
+    ),
+    "markets": (
+        "slug", "question", "home_team", "away_team", "long_team",
+        "game_pk", "start_time", "first_seen_ts",
+    ),
+}
 
 
 def _model_artifact_hash(cfg: Config) -> str | None:
@@ -95,27 +99,29 @@ def tape_digest(journal: Journal, folds: list[dict]) -> str:
     start = min(_bounds(fold["train"])[0] for fold in folds)
     end = max(_bounds(fold["test"])[1] for fold in folds)
     hasher = hashlib.sha256()
-    queries = (
-        ("price_ticks", "SELECT * FROM price_ticks WHERE COALESCE(received_at,ts)>=? "
-         "AND COALESCE(received_at,ts)<? ORDER BY COALESCE(received_at,ts),rowid"),
-        # Include one day beyond the last decision boundary because final game
-        # outcomes are labels for calibration, not information exposed to replay.
-        ("game_states", "SELECT * FROM game_states WHERE COALESCE(received_at,ts)>=? "
-         "AND COALESCE(received_at,ts)<? ORDER BY COALESCE(received_at,ts),rowid"),
-        ("model_observations", "SELECT * FROM model_observations WHERE ts>=? "
-         "AND ts<? ORDER BY ts,rowid"),
-        ("markets", "SELECT * FROM markets WHERE first_seen_ts<? ORDER BY slug"),
-    )
-    for table, query in queries:
+    for table, columns in _TAPE_COLUMNS.items():
         hasher.update(table.encode())
+        select = ", ".join(columns)
         if table == "markets":
+            query = (f"SELECT {select} FROM markets WHERE first_seen_ts<? "
+                     "ORDER BY slug")
             params = (end,)
-        elif table == "game_states":
-            params = (start, end + 86400)
-        else:
+        elif table == "model_observations":
+            query = (f"SELECT {select} FROM model_observations WHERE ts>=? "
+                     "AND ts<? ORDER BY ts,rowid")
             params = (start, end)
+        else:
+            query = (f"SELECT {select} FROM {table} "
+                     "WHERE COALESCE(received_at,ts)>=? AND COALESCE(received_at,ts)<? "
+                     "ORDER BY COALESCE(received_at,ts),rowid")
+            if table == "game_states":
+                # The replay seeds states from before each window, and final
+                # scores up to a day after the last boundary label calibration.
+                params = (start - PREGAME_STATE_LOOKBACK_SECS, end + 86400)
+            else:
+                params = (start, end)
         for row in journal.conn.execute(query, params):
-            hasher.update(_canonical(dict(row)).encode())
+            hasher.update(canonical(dict(row)).encode())
     return hasher.hexdigest()
 
 
@@ -127,27 +133,20 @@ def prepare_manifest(cfg: Config, db_path: str, start_day: str, fold_count: int,
     if target.exists():
         raise FileExistsError(f"refusing to overwrite preregistration: {target}")
     folds = build_folds(start_day, fold_count, cfg.engine.report_timezone)
-    promotion = rules or {
-        "min_round_trips": 300,
-        "min_trading_days": 30,
-        "min_games": 100,
-        "min_positive_test_folds": 2,
-        "require_positive_net_pnl": True,
-        "require_positive_game_cluster_ci_low": True,
-        "max_top_day_profit_share": 0.35,
-    }
+    promotion = {**DEFAULT_PROMOTION_RULES, **(rules or {})}
     for key in ("min_round_trips", "min_trading_days", "min_games",
                 "min_positive_test_folds"):
         if promotion[key] < 0:
             raise ValueError(f"{key} cannot be negative")
-    if not 0 <= promotion["max_top_day_profit_share"] <= 1:
-        raise ValueError("max_top_day_profit_share must be between 0 and 1")
+    for key in ("max_top_day_profit_share", "max_top_game_profit_share"):
+        if not 0 <= promotion[key] <= 1:
+            raise ValueError(f"{key} must be between 0 and 1")
     journal = Journal(db_path)
     try:
         data_hash = tape_digest(journal, folds)
     finally:
         journal.close()
-    code_revision, code_hash = _code_identity()
+    code_revision, code_hash = code_identity()
     manifest = {
         "format_version": FORMAT_VERSION,
         "kind": "polybot_walk_forward_preregistration",
@@ -155,20 +154,21 @@ def prepare_manifest(cfg: Config, db_path: str, start_day: str, fold_count: int,
         "hypothesis": hypothesis.strip(),
         "selection_rule": (
             "among strategies with at least one train and validation round trip, "
-            "highest validation net P&L; ties resolved by strategy name"
+            "highest validation realized P&L (closed round trips and settlements, "
+            "net of fees); ties resolved by strategy name"
         ),
         "windows": {"train_days": TRAIN_DAYS, "validate_days": VALIDATE_DAYS,
                     "locked_test_days": TEST_DAYS, "roll_days": ROLL_DAYS},
         "timezone": cfg.engine.report_timezone,
         "folds": folds,
         "promotion_rules": promotion,
-        "config_hash": _config_hash(cfg),
+        "config_hash": config_hash(cfg),
         "code_revision": code_revision,
         "code_hash": code_hash,
         "state_model_artifact_hash": _model_artifact_hash(cfg),
         "data_version": data_hash,
     }
-    manifest["manifest_sha256"] = _digest(manifest)
+    manifest["manifest_sha256"] = digest(manifest)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest
@@ -177,21 +177,33 @@ def prepare_manifest(cfg: Config, db_path: str, start_day: str, fold_count: int,
 def load_manifest(path: str, cfg: Config, journal: Journal) -> dict:
     manifest = json.loads(Path(path).read_text())
     supplied = manifest.pop("manifest_sha256", None)
-    actual = _digest(manifest)
+    actual = digest(manifest)
     manifest["manifest_sha256"] = supplied
     if supplied != actual:
         raise ValueError("preregistration checksum mismatch")
     if manifest.get("format_version") != FORMAT_VERSION:
         raise ValueError("unsupported walk-forward manifest version")
-    if manifest.get("config_hash") != _config_hash(cfg):
+    if manifest.get("config_hash") != config_hash(cfg):
         raise ValueError("current config does not match the preregistered config")
-    if manifest.get("code_hash") != _code_identity()[1]:
+    if manifest.get("code_hash") != code_identity()[1]:
         raise ValueError("research code changed after preregistration")
     if manifest.get("state_model_artifact_hash") != _model_artifact_hash(cfg):
         raise ValueError("state-model artifact changed after preregistration")
     if manifest.get("data_version") != tape_digest(journal, manifest["folds"]):
         raise ValueError("event tape changed after preregistration")
     return manifest
+
+
+def _sanitize(value):
+    """Replace non-finite floats with None so results digest and serialize
+    under one JSON policy instead of crashing after the locked test ran."""
+    if isinstance(value, dict):
+        return {key: _sanitize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _cluster_ci(values: dict[str, float], seed: str) -> list[float | None]:
@@ -249,6 +261,7 @@ def _adverse_selection(journal: Journal, trades) -> dict[str, dict]:
             ).fetchone()
             if not row or row["long_bid"] is None or row["long_ask"] is None:
                 continue
+            # Tokens are "<slug>:LONG"/"<slug>:SHORT"; ticks quote the long side.
             bid = row["long_bid"] if trade.token.endswith(":LONG") else 1.0 - row["long_ask"]
             marks.append(bid - trade.entry_price)
         result[str(horizon)] = {
@@ -259,20 +272,25 @@ def _adverse_selection(journal: Journal, trades) -> dict[str, dict]:
     return result
 
 
-def _strategy_metrics(report, strategy: str, journal: Journal, timezone: str) -> dict:
+def _strategy_metrics(report, strategy: str, journal: Journal, timezone: str,
+                      execution_quality: bool = True) -> dict:
     row = next(result for result in report.results if result.strategy == strategy)
     trades = [trade for trade in report.trades if trade.strategy == strategy]
     groups = _groups(trades, timezone)
     day_pnl = list(groups["day"].values())
     tail_count = max(1, math.ceil(0.05 * len(day_pnl))) if day_pnl else 0
     net_pnl = row.equity - report.starting_cash
-    deployed = row.deployed_capital
+    turnover = row.deployed_capital
+    peak_deployed = row.peak_deployed
     entry_attempts = row.filled_entries + row.rejected_entries
     return {
         "round_trips": len(trades), "wins": row.wins,
         "net_pnl": net_pnl, "realized_pnl": row.realized, "fees": row.fees,
-        "return_on_deployed_capital": net_pnl / deployed if deployed else 0.0,
-        "deployed_capital": deployed,
+        "return_on_deployed_capital": (
+            net_pnl / peak_deployed if peak_deployed else 0.0
+        ),
+        "peak_deployed_capital": peak_deployed,
+        "turnover": turnover,
         "max_drawdown": row.max_drawdown,
         "expected_shortfall_5pct_daily": (
             statistics.mean(sorted(day_pnl)[:tail_count]) if tail_count else None
@@ -281,14 +299,17 @@ def _strategy_metrics(report, strategy: str, journal: Journal, timezone: str) ->
         "filled_entries": row.filled_entries,
         "rejected_entries": row.rejected_entries,
         "rejected_exits": row.rejected_exits,
-        "fee_share_of_deployed": row.fees / deployed if deployed else 0.0,
+        "fee_share_of_turnover": row.fees / turnover if turnover else 0.0,
         "open_positions_at_boundary": row.open_positions,
         "trading_days": len(groups["day"]), "games": len(groups["game"]),
         "day_clustered_mean_pnl_ci95": _cluster_ci(groups["day"], strategy + ":day"),
         "game_clustered_mean_pnl_ci95": _cluster_ci(groups["game"], strategy + ":game"),
         "top_day_profit_share": _profit_share(groups["day"]),
+        "top_game_profit_share": _profit_share(groups["game"]),
         "concentration": groups,
-        "adverse_selection": _adverse_selection(journal, trades),
+        "adverse_selection": (
+            _adverse_selection(journal, trades) if execution_quality else None
+        ),
     }
 
 
@@ -299,9 +320,10 @@ def _calibration(journal: Journal, start: float, end: float) -> dict:
            FROM model_observations o
            JOIN (SELECT game_pk,home_score,away_score,
                         ROW_NUMBER() OVER (PARTITION BY game_pk ORDER BY COALESCE(received_at,ts) DESC) n
-                 FROM game_states WHERE status='Final') f
+                 FROM game_states WHERE status='Final'
+                   AND COALESCE(received_at,ts) < ?) f
              ON f.game_pk=o.game_pk AND f.n=1
-           WHERE o.ts>=? AND o.ts<?""", (start, end)).fetchall()
+           WHERE o.ts>=? AND o.ts<?""", (end + 86400, start, end)).fetchall()
     by_model: dict[str, list] = {}
     for row in rows:
         by_model.setdefault(row["model"], []).append(row)
@@ -327,16 +349,20 @@ def _calibration(journal: Journal, start: float, end: float) -> dict:
     return result
 
 
-def _run_window(cfg: Config, journal: Journal, window: list[str], label: str) -> dict:
+def _run_window(cfg: Config, journal: Journal, window: list[str], label: str,
+                execution_quality: bool = True) -> dict:
     start, end = _bounds(window)
     report = CausalReplay(cfg, journal, start, end, label).run()
     return {
         "strategies": {row.strategy: _strategy_metrics(
-            report, row.strategy, journal, cfg.engine.report_timezone
+            report, row.strategy, journal, cfg.engine.report_timezone,
+            execution_quality=execution_quality,
         ) for row in report.results},
         # Calibration replays nothing: it scores the model_home probabilities the
         # live engine recorded per distinct state, keyed by the recording model.
-        "calibration": _calibration(journal, start, end),
+        "calibration": (
+            _calibration(journal, start, end) if execution_quality else None
+        ),
         "calibration_source": "live_recorded_model_observations",
         "events": report.events, "run_boundaries": report.run_boundaries,
         "state_model": report.state_model,
@@ -344,10 +370,17 @@ def _run_window(cfg: Config, journal: Journal, window: list[str], label: str) ->
 
 
 def _aggregate_selected(folds: list[dict], rules: dict) -> dict:
+    rules = {**DEFAULT_PROMOTION_RULES, **rules}
+    chosen = [fold for fold in folds if fold.get("selected_strategy")]
     selected = [fold["locked_test"]["strategies"][fold["selected_strategy"]]
-                for fold in folds if fold.get("selected_strategy")]
+                for fold in chosen]
+    strategies_selected = sorted({fold["selected_strategy"] for fold in chosen})
     aggregate = {
         "folds": len(selected),
+        "strategies_selected": strategies_selected,
+        "candidates_considered": max(
+            (fold.get("candidates_considered", 0) for fold in folds), default=0,
+        ),
         "round_trips": sum(row["round_trips"] for row in selected),
         "trading_days": sum(row["trading_days"] for row in selected),
         "games": sum(row["games"] for row in selected),
@@ -355,6 +388,8 @@ def _aggregate_selected(folds: list[dict], rules: dict) -> dict:
         "fees": sum(row["fees"] for row in selected),
         "max_drawdown": max((row["max_drawdown"] for row in selected), default=0.0),
         "max_top_day_profit_share": max((row["top_day_profit_share"] for row in selected), default=0.0),
+        "max_top_game_profit_share": max(
+            (row.get("top_game_profit_share", 0.0) for row in selected), default=0.0),
         "positive_test_folds": sum(row["net_pnl"] > 0 for row in selected),
     }
     checks = {
@@ -362,9 +397,15 @@ def _aggregate_selected(folds: list[dict], rules: dict) -> dict:
         "min_trading_days": aggregate["trading_days"] >= rules["min_trading_days"],
         "min_games": aggregate["games"] >= rules["min_games"],
         "multiple_positive_folds": aggregate["positive_test_folds"] >=
-            rules.get("min_positive_test_folds", 1),
+            rules["min_positive_test_folds"],
         "positive_net_pnl": (not rules["require_positive_net_pnl"] or aggregate["net_pnl"] > 0),
         "day_concentration": aggregate["max_top_day_profit_share"] <= rules["max_top_day_profit_share"],
+        "game_concentration": aggregate["max_top_game_profit_share"]
+            <= rules["max_top_game_profit_share"],
+        # One strategy goes live; evidence stitched from rotating champions
+        # must not gate a single-strategy promotion.
+        "consistent_champion": (not rules["require_consistent_champion"]
+                                or len(strategies_selected) <= 1),
         "positive_game_cluster_ci": (
             not rules["require_positive_game_cluster_ci_low"] or
             all(row["game_clustered_mean_pnl_ci95"][0] is not None and
@@ -383,35 +424,59 @@ def evaluate_manifest(cfg: Config, db_path: str, manifest_path: str, output: str
     journal = Journal(db_path)
     try:
         manifest = load_manifest(manifest_path, cfg, journal)
+        prior = journal.walk_forward_evaluation(manifest["manifest_sha256"])
+        if prior is not None:
+            raise FileExistsError(
+                "this preregistration was already evaluated once "
+                f"(result {prior['result_sha256'][:12]} at {prior['output_path']}); "
+                "locked tests are revealed a single time"
+            )
         fold_results = []
         for fold in manifest["folds"]:
-            train = _run_window(cfg, journal, fold["train"], f"fold {fold['fold']} train")
+            # The train replay exists only to establish liveness; skip the
+            # expensive execution-quality extras there.
+            train = _run_window(cfg, journal, fold["train"],
+                                f"fold {fold['fold']} train",
+                                execution_quality=False)
             validate = _run_window(cfg, journal, fold["validate"], f"fold {fold['fold']} validate")
             eligible = [name for name, metrics in validate["strategies"].items()
                         if metrics["round_trips"] > 0 and name in train["strategies"]
                         and train["strategies"][name]["round_trips"] > 0]
-            selected = sorted(eligible, key=lambda name: (-validate["strategies"][name]["net_pnl"], name))
+            selected = sorted(
+                eligible,
+                key=lambda name: (-validate["strategies"][name]["realized_pnl"], name),
+            )
             # Selection is fixed from train/validation before this call reveals the locked test.
             locked = _run_window(cfg, journal, fold["test"], f"fold {fold['fold']} locked test")
             fold_results.append({
                 "fold": fold["fold"], "selected_strategy": selected[0] if selected else None,
+                "candidates_considered": len(validate["strategies"]),
+                "eligible_ranked": [
+                    {"strategy": name,
+                     "validation_realized_pnl": validate["strategies"][name]["realized_pnl"]}
+                    for name in selected
+                ],
                 "train": train, "validate": validate, "locked_test": locked,
             })
+        result = _sanitize({
+            "format_version": FORMAT_VERSION,
+            "kind": "polybot_walk_forward_result",
+            "evaluated_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+            "manifest_path": str(Path(manifest_path)),
+            "manifest_sha256": manifest["manifest_sha256"],
+            "folds": fold_results,
+            "selected_champion_aggregate": _aggregate_selected(
+                fold_results, manifest["promotion_rules"]),
+        })
+        result["result_sha256"] = digest(result)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(result, indent=2, sort_keys=True,
+                                     allow_nan=False) + "\n")
+        journal.record_walk_forward_evaluation(
+            manifest["manifest_sha256"], result["result_sha256"], str(target),
+        )
     finally:
         journal.close()
-    result = {
-        "format_version": FORMAT_VERSION,
-        "kind": "polybot_walk_forward_result",
-        "evaluated_at": datetime.now(ZoneInfo("UTC")).isoformat(),
-        "manifest_path": str(Path(manifest_path)),
-        "manifest_sha256": manifest["manifest_sha256"],
-        "folds": fold_results,
-        "selected_champion_aggregate": _aggregate_selected(
-            fold_results, manifest["promotion_rules"]),
-    }
-    result["result_sha256"] = _digest(result)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
 
 
@@ -428,4 +493,7 @@ def print_result(result: dict) -> None:
     agg = result["selected_champion_aggregate"]
     print(f"aggregate: trades={agg['round_trips']} days={agg['trading_days']} "
           f"games={agg['games']} net=${agg['net_pnl']:+.2f} fees=${agg['fees']:.2f}")
+    if len(agg.get("strategies_selected", [])) > 1:
+        print("champions : " + ", ".join(agg["strategies_selected"])
+              + " (mixed selection across folds)")
     print("promotion gate: " + ("PASS" if agg["passes_preregistered_rules"] else "FAIL"))

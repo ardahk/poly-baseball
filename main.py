@@ -174,29 +174,33 @@ def cmd_research(args, cfg):
 
 
 def cmd_walk_forward(args, cfg):
-    if args.walk_command == "prepare":
-        rules = {
-            "min_round_trips": args.min_round_trips,
-            "min_trading_days": args.min_trading_days,
-            "min_games": args.min_games,
-            "min_positive_test_folds": args.min_positive_test_folds,
-            "require_positive_net_pnl": True,
-            "require_positive_game_cluster_ci_low": not args.allow_nonpositive_ci,
-            "max_top_day_profit_share": args.max_top_day_profit_share,
-        }
-        manifest = walkforward.prepare_manifest(
-            cfg, cfg.engine.db_path, args.start, args.folds,
-            args.hypothesis, args.output, rules,
-        )
-        print(f"locked preregistration: {args.output}")
-        print(f"manifest sha256      : {manifest['manifest_sha256']}")
-        print("No train, validation, or locked-test results were computed.")
-    else:
-        result = walkforward.evaluate_manifest(
-            cfg, cfg.engine.db_path, args.manifest, args.output
-        )
-        walkforward.print_result(result)
-        print(f"full evidence: {args.output}")
+    try:
+        if args.walk_command == "prepare":
+            rules = {
+                "min_round_trips": args.min_round_trips,
+                "min_trading_days": args.min_trading_days,
+                "min_games": args.min_games,
+                "min_positive_test_folds": args.min_positive_test_folds,
+                "require_positive_game_cluster_ci_low": not args.allow_nonpositive_ci,
+                "require_consistent_champion": not args.allow_mixed_champions,
+                "max_top_day_profit_share": args.max_top_day_profit_share,
+                "max_top_game_profit_share": args.max_top_game_profit_share,
+            }
+            manifest = walkforward.prepare_manifest(
+                cfg, cfg.engine.db_path, args.start, args.folds,
+                args.hypothesis, args.output, rules,
+            )
+            print(f"locked preregistration: {args.output}")
+            print(f"manifest sha256      : {manifest['manifest_sha256']}")
+            print("No train, validation, or locked-test results were computed.")
+        else:
+            result = walkforward.evaluate_manifest(
+                cfg, cfg.engine.db_path, args.manifest, args.output
+            )
+            walkforward.print_result(result)
+            print(f"full evidence: {args.output}")
+    except (FileExistsError, ValueError) as exc:
+        raise SystemExit(f"walk-forward: {exc}") from None
 
 
 def main():
@@ -261,13 +265,23 @@ def main():
     p_prepare.add_argument("--hypothesis", required=True,
                            help="strategy hypothesis declared before test evaluation")
     p_prepare.add_argument("--output", default="artifacts/walk-forward-prereg.json")
-    p_prepare.add_argument("--min-round-trips", type=int, default=300)
-    p_prepare.add_argument("--min-trading-days", type=int, default=30)
-    p_prepare.add_argument("--min-games", type=int, default=100)
-    p_prepare.add_argument("--min-positive-test-folds", type=int, default=2)
-    p_prepare.add_argument("--max-top-day-profit-share", type=float, default=0.35)
+    rule_defaults = walkforward.DEFAULT_PROMOTION_RULES
+    p_prepare.add_argument("--min-round-trips", type=int,
+                           default=rule_defaults["min_round_trips"])
+    p_prepare.add_argument("--min-trading-days", type=int,
+                           default=rule_defaults["min_trading_days"])
+    p_prepare.add_argument("--min-games", type=int,
+                           default=rule_defaults["min_games"])
+    p_prepare.add_argument("--min-positive-test-folds", type=int,
+                           default=rule_defaults["min_positive_test_folds"])
+    p_prepare.add_argument("--max-top-day-profit-share", type=float,
+                           default=rule_defaults["max_top_day_profit_share"])
+    p_prepare.add_argument("--max-top-game-profit-share", type=float,
+                           default=rule_defaults["max_top_game_profit_share"])
     p_prepare.add_argument("--allow-nonpositive-ci", action="store_true",
                            help="do not require the game-clustered CI lower bound above zero")
+    p_prepare.add_argument("--allow-mixed-champions", action="store_true",
+                           help="let folds that select different strategies still pass the gate")
     p_evaluate = walk_sub.add_parser(
         "evaluate", help="verify preregistration and reveal locked tests once"
     )
