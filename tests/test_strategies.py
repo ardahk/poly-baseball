@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 from polybot.config import Config, StrategyConfig
@@ -6,11 +8,14 @@ from polybot.strategies import (
     AIShadowStrategy,
     FadeStrategy,
     Intent,
+    MarketAnchoredStrategy,
+    StateResidualStrategy,
     StratContext,
     build_strategies,
 )
 from polybot.ai_judge import Judgment
 from polybot.volatility import PriceHistory
+from polybot.model_features import ModelHistory
 
 
 def market():
@@ -133,6 +138,19 @@ def test_fade_no_signal_passes_through_outcome():
     assert d.evaluation is not None
 
 
+def test_sampling_stable_fade_ignores_lifetime_only_flips():
+    cfg = dataclasses.replace(CFG, sampling_stable_features=True,
+                              flip_window_secs=20, min_volatility=99.0)
+    strategy = FadeStrategy("time", "v1", cfg)
+    history = PriceHistory(flip_band=0.03)
+    for ts, price in [(0, 0.40), (10, 0.60), (100, 0.40)]:
+        history.add(price, ts)
+    gs = GameState(1, status="Live", inning=7, home_score=4, away_score=1)
+    decision = strategy.evaluate(fade_ctx(history, gs, bid=0.39, ask=0.41))
+    assert history.flips == 2
+    assert decision.outcome == "not_playful"
+
+
 def test_fade_manage_returns_exit_intents():
     s = FadeStrategy("fade_v1_frozen", "v1", CFG)
     gs = GameState(1, status="Live")
@@ -146,12 +164,15 @@ def test_fade_manage_returns_exit_intents():
 
 # --------------------------------------------------------------- Task 3: registry
 
-def test_default_registry_builds_two_fade_variants():
+def test_default_registry_builds_controls_and_phase3_variants():
     cfg = Config()
     cfg.ai.enabled = False
     strats = build_strategies(cfg)
     names = [s.name for s in strats]
-    assert names == ["fade_v1_frozen", "fade_tight"]
+    assert names == [
+        "fade_v1_frozen", "fade_tight", "liquidity_fade_v2",
+        "state_residual_v1", "market_anchor_v1",
+    ]
     assert isinstance(strats[0], FadeStrategy)
 
 
@@ -174,6 +195,63 @@ def test_unknown_kind_raises():
     cfg.strategies = [{"name": "x", "kind": "bogus"}]
     with pytest.raises(ValueError, match="unknown strategy kind"):
         build_strategies(cfg)
+
+
+def _anchored_context(current_mid, *, pregame=True, changed=True):
+    model = ModelHistory(
+        lambda gs: 0.70 if gs.home_score > gs.away_score else 0.50,
+        pregame_model_home=0.50,
+    )
+    if pregame:
+        model.add_price(0.50, 1.0)
+    first = GameState(1, status="Live", home_score=0, away_score=0)
+    model.observe_state(first, 2.0)
+    model.add_price(0.50, 3.0)
+    gs = first
+    if changed:
+        gs = GameState(1, status="Live", home_score=1, away_score=0)
+        model.observe_state(gs, 4.0)
+    history = PriceHistory()
+    history.add(current_mid, 5.0)
+    return StratContext(
+        market(), history, gs,
+        MarketQuote("m1", current_mid - 0.01, current_mid + 0.01,
+                    current_mid - 0.01, current_mid + 0.01, ts=5.0),
+        now=5.0, model_history=model,
+    )
+
+
+def test_state_residual_trades_toward_causal_anchored_fair():
+    cfg = StrategyConfig(min_edge=0.02, residual_threshold=0.04,
+                         residual_min_model_delta=0.01, max_price=0.99)
+    strat = StateResidualStrategy("residual", "v1", cfg)
+    decision = strat.evaluate(_anchored_context(0.60))
+    assert decision.outcome == "signal"
+    assert decision.intent.token == market().home_token
+    assert decision.evaluation.anchor_price == 0.50
+    assert decision.evaluation.model_delta == pytest.approx(0.20)
+    assert decision.evaluation.residual < 0
+
+
+def test_market_anchor_requires_a_recorded_pregame_price():
+    cfg = StrategyConfig(min_edge=0.02, residual_threshold=0.04,
+                         residual_min_model_delta=0.01, max_price=0.99)
+    strat = MarketAnchoredStrategy("anchor", "v1", cfg)
+    decision = strat.evaluate(_anchored_context(0.60, pregame=False))
+    assert decision.outcome == "no_pregame_anchor"
+    assert decision.intent is None
+
+
+def test_registry_builds_phase3_strategy_kinds():
+    cfg = Config()
+    cfg.ai.enabled = False
+    cfg.strategies = [
+        {"name": "r", "kind": "state_residual"},
+        {"name": "a", "kind": "market_anchored"},
+    ]
+    built = build_strategies(cfg)
+    assert isinstance(built[0], StateResidualStrategy)
+    assert isinstance(built[1], MarketAnchoredStrategy)
 
 
 # --------------------------------------------------------------- Task 4: AI shadow

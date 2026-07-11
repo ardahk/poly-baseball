@@ -12,7 +12,10 @@ Usage:
   python main.py review          # end-of-day observability review
   python main.py backtest calibrate --days 3   # is the win-prob formula accurate?
   python main.py backtest strategy  --days 2   # would the trading logic profit?
-  python main.py backtest replay --date 2026-07-08 --set strategy.stop_loss=0.15
+  python main.py backtest causal --date 2026-07-08 --set strategy.stop_loss=0.15
+  python main.py research diagnose --date 2026-07-08
+  python main.py walk-forward prepare --start 2026-05-01 --folds 4 --hypothesis "..."
+  python main.py walk-forward evaluate --manifest artifacts/walk-forward-prereg.json
 """
 from __future__ import annotations
 
@@ -21,12 +24,13 @@ import logging
 import sys
 from datetime import datetime
 
-from polybot import backtest, causal_replay, mlb, pmus
+from polybot import backtest, causal_replay, mlb, pmus, research, walkforward
 from polybot.config import load_config
 from polybot.engine import Engine
 from polybot.journal import Journal
 from polybot.report import print_report
 from polybot.review import print_review
+from polybot.strategies import DEFAULT_REGISTRY
 from polybot.winprob import home_win_probability
 
 
@@ -98,7 +102,8 @@ def cmd_status(args, cfg):
         print(f"latest game state: {_fmt_ts(status['latest_game_state_ts'])}")
         print(f"trade opens      : {status['trades'].get('OPEN', 0)}")
         print(f"trade closes     : {status['trades'].get('CLOSE', 0)}")
-        accounts, positions = journal.paper_state(["math", "ai"])
+        registry = cfg.strategies or DEFAULT_REGISTRY
+        accounts, positions = journal.paper_state([entry["name"] for entry in registry])
         if accounts:
             print("persisted paper account:")
             for strategy, account in sorted(accounts.items()):
@@ -154,6 +159,46 @@ def cmd_backtest(args, cfg):
         causal_replay.print_report(report)
 
 
+def cmd_research(args, cfg):
+    if args.research_command == "fit-state":
+        research.fit_state_artifact(
+            args.seasons, args.holdout, args.output,
+            prior_strength=args.prior_strength, max_games=args.max_games,
+        )
+    else:
+        research.diagnose_day(
+            cfg.engine.db_path, args.date,
+            args.timezone or cfg.engine.report_timezone,
+            cfg.engine.paper_taker_fee_theta,
+        )
+
+
+def cmd_walk_forward(args, cfg):
+    if args.walk_command == "prepare":
+        rules = {
+            "min_round_trips": args.min_round_trips,
+            "min_trading_days": args.min_trading_days,
+            "min_games": args.min_games,
+            "min_positive_test_folds": args.min_positive_test_folds,
+            "require_positive_net_pnl": True,
+            "require_positive_game_cluster_ci_low": not args.allow_nonpositive_ci,
+            "max_top_day_profit_share": args.max_top_day_profit_share,
+        }
+        manifest = walkforward.prepare_manifest(
+            cfg, cfg.engine.db_path, args.start, args.folds,
+            args.hypothesis, args.output, rules,
+        )
+        print(f"locked preregistration: {args.output}")
+        print(f"manifest sha256      : {manifest['manifest_sha256']}")
+        print("No train, validation, or locked-test results were computed.")
+    else:
+        result = walkforward.evaluate_manifest(
+            cfg, cfg.engine.db_path, args.manifest, args.output
+        )
+        walkforward.print_result(result)
+        print(f"full evidence: {args.output}")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="polybot")
     parser.add_argument("--config", default="config.yaml")
@@ -188,6 +233,46 @@ def main():
     p_bt.add_argument("--date", help="recorded local day for replay, YYYY-MM-DD")
     p_bt.add_argument("--set", action="append", default=[],
                       help="override config for replay/strategy, e.g. strategy.stop_loss=0.15")
+    p_research = sub.add_parser("research", help="fit and diagnose Phase 3 models")
+    research_sub = p_research.add_subparsers(dest="research_command", required=True)
+    p_fit = research_sub.add_parser("fit-state", help="fit an empirical state model")
+    p_fit.add_argument("--seasons", type=int, nargs="+", required=True,
+                       help="training seasons, e.g. 2022 2023 2024")
+    p_fit.add_argument("--holdout", type=int, required=True,
+                       help="untouched acceptance season")
+    p_fit.add_argument("--output", required=True, help="artifact JSON path")
+    p_fit.add_argument("--prior-strength", type=float, default=30.0)
+    p_fit.add_argument("--max-games", type=int, default=0,
+                       help="cap games per season for a smoke run (0 = all)")
+    p_diag = research_sub.add_parser("diagnose", help="show executable signal markouts")
+    p_diag.add_argument("--date", help="local date, YYYY-MM-DD (default: today)")
+    p_diag.add_argument("--timezone", help="IANA trading-day timezone")
+    p_walk = sub.add_parser(
+        "walk-forward", help="preregister and run chronological Phase 4 evaluation"
+    )
+    walk_sub = p_walk.add_subparsers(dest="walk_command", required=True)
+    p_prepare = walk_sub.add_parser(
+        "prepare", help="lock hypothesis, folds, config, tape, and promotion rules"
+    )
+    p_prepare.add_argument("--start", required=True,
+                           help="first training day, YYYY-MM-DD")
+    p_prepare.add_argument("--folds", type=int, required=True,
+                           help="number of weekly 28/7/7 folds")
+    p_prepare.add_argument("--hypothesis", required=True,
+                           help="strategy hypothesis declared before test evaluation")
+    p_prepare.add_argument("--output", default="artifacts/walk-forward-prereg.json")
+    p_prepare.add_argument("--min-round-trips", type=int, default=300)
+    p_prepare.add_argument("--min-trading-days", type=int, default=30)
+    p_prepare.add_argument("--min-games", type=int, default=100)
+    p_prepare.add_argument("--min-positive-test-folds", type=int, default=2)
+    p_prepare.add_argument("--max-top-day-profit-share", type=float, default=0.35)
+    p_prepare.add_argument("--allow-nonpositive-ci", action="store_true",
+                           help="do not require the game-clustered CI lower bound above zero")
+    p_evaluate = walk_sub.add_parser(
+        "evaluate", help="verify preregistration and reveal locked tests once"
+    )
+    p_evaluate.add_argument("--manifest", required=True)
+    p_evaluate.add_argument("--output", default="artifacts/walk-forward-result.json")
     args = parser.parse_args()
 
     dashboard_mode = args.command == "run" and getattr(args, "dashboard", False)
@@ -200,7 +285,8 @@ def main():
 
     cfg = load_config(args.config)
     {"run": cmd_run, "scan": cmd_scan, "status": cmd_status, "report": cmd_report,
-     "review": cmd_review, "backtest": cmd_backtest}[args.command](args, cfg)
+     "review": cmd_review, "backtest": cmd_backtest,
+     "research": cmd_research, "walk-forward": cmd_walk_forward}[args.command](args, cfg)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ class PriceHistory:
         self.flip_band = flip_band
         self.flips = 0
         self._regime: int | None = None  # +1 above band, -1 below band
+        self._flip_times: deque[float] = deque(maxlen=max_samples)
 
     def add(self, price: float, ts: float | None = None) -> None:
         ts = ts if ts is not None else time.time()
@@ -30,6 +31,7 @@ class PriceHistory:
             return
         if self._regime is not None and regime != self._regime:
             self.flips += 1
+            self._flip_times.append(ts)
         self._regime = regime
 
     @property
@@ -66,5 +68,33 @@ class PriceHistory:
             return 0.0
         return statistics.pstdev(deltas)
 
-    def is_playful(self, min_flips: int, min_volatility: float, vol_window: int = 30) -> bool:
-        return self.flips >= min_flips or self.realized_vol(vol_window) >= min_volatility
+    def realized_vol_time(self, window_secs: float = 60.0,
+                          bucket_secs: float = 5.0) -> float:
+        """Volatility on a fixed time grid, stable across polling frequencies."""
+        if len(self.samples) < 3 or window_secs <= 0 or bucket_secs <= 0:
+            return 0.0
+        samples = list(self.samples)
+        end = samples[-1][0]
+        start = end - window_secs
+        grid: list[float] = []
+        cursor = start
+        index = 0
+        last_price = None
+        while cursor <= end + 1e-9:
+            while index < len(samples) and samples[index][0] <= cursor:
+                last_price = samples[index][1]
+                index += 1
+            if last_price is not None:
+                grid.append(last_price)
+            cursor += bucket_secs
+        if not grid or grid[-1] != samples[-1][1]:
+            grid.append(samples[-1][1])
+        deltas = [b - a for a, b in zip(grid, grid[1:])]
+        return statistics.pstdev(deltas) if len(deltas) >= 2 else 0.0
+
+    def flips_within(self, seconds: float) -> int:
+        """Regime crossings inside a trailing receipt-time window."""
+        if not self.samples:
+            return 0
+        cutoff = self.samples[-1][0] - seconds
+        return sum(ts >= cutoff for ts in self._flip_times)

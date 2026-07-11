@@ -40,10 +40,22 @@ class StrategyConfig:
     flip_band: float = 0.03              # hysteresis band around 0.5
     min_volatility: float = 0.015        # OR realized vol threshold
     vol_window: int = 30                 # samples for realized vol
+    sampling_stable_features: bool = False  # fixed receipt-time grid (Phase 3 variants)
+    feature_window_secs: float = 90.0
+    feature_bucket_secs: float = 5.0
+    flip_window_secs: float = 600.0
     # Signal capture: collapse a continuously-firing signal into ONE episode so
     # the signals/counterfactuals tables aren't flooded with dependent samples.
     # A new episode starts only after the condition goes quiet for this long.
     signal_episode_secs: float = 120.0
+    # Phase 3 state-response models. Model probability *changes* are moved onto
+    # a causal market anchor in log-odds space; absolute model level is not used
+    # as though it were a team-strength-aware market price.
+    residual_beta: float = 1.0
+    residual_threshold: float = 0.06
+    residual_min_model_delta: float = 0.02
+    residual_response_secs: float = 45.0
+    market_anchor_max_age_secs: float = 21600.0
 
 
 @dataclass
@@ -78,6 +90,8 @@ class EngineConfig:
     paper_taker_fee_theta: float = 0.06  # Polymarket US fee coefficient, effective 2026-07
     causal_replay_latency_secs: float = 0.5  # fill on first BBO observed after this delay
     history_gap_reset_secs: float = 180.0    # discard rolling features after data outages
+    counterfactual_max_lag_secs: float = 5.0  # late horizons become unavailable, not backfilled
+    state_model_path: str | None = None      # accepted empirical-state artifact; analytic if null
     report_timezone: str = "America/Los_Angeles"  # trading-day/report boundary
     live: bool = False
     db_path: str = "polybot.db"

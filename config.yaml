@@ -25,10 +25,19 @@ strategy:
   flip_band: 0.03             #   ...beyond this band around 0.5
   min_volatility: 0.015       # OR realized vol >= this
   vol_window: 30
+  sampling_stable_features: false # v1 controls retain legacy sample windows
+  feature_window_secs: 90       # Phase 3 fixed receipt-time feature window
+  feature_bucket_secs: 5
+  flip_window_secs: 600
   signal_episode_secs: 120    # collapse a continuously-firing signal into ONE
                               # logged episode; a new one starts only after the
                               # condition goes quiet this long (avoids dependent
                               # duplicate rows in signals/counterfactuals)
+  residual_beta: 1.0          # transfer this fraction of model log-odds changes
+  residual_threshold: 0.06    # market must miss anchored fair by at least 6c
+  residual_min_model_delta: 0.02 # ignore state updates with <2pt model impact
+  residual_response_secs: 45  # short state-reaction window for residual strategy
+  market_anchor_max_age_secs: 21600 # frozen pregame anchor valid through a game
 
 risk:
   stake_usd: 5                # base notional per trade
@@ -50,7 +59,7 @@ ai:
 # and competes on the same market/game stream. `overrides` patch the `strategy:`
 # block above. `kind: ai_shadow` judges a base strategy's candidates
 # asynchronously (skipped when ai.enabled is false). Delete this block to fall
-# back to the built-in default (fade_v1_frozen + fade_tight + ai_shadow).
+# back to the built-in frozen controls + Phase 3 variants + ai_shadow.
 strategies:
   - name: fade_v1_frozen       # the control: today's strategy config, unchanged
     kind: fade
@@ -59,6 +68,14 @@ strategies:
     overrides:
       move_threshold: 0.15
       min_edge: 0.09
+  - name: liquidity_fade_v2    # unchanged-book shock control; time-stable features
+    kind: fade
+    overrides:
+      sampling_stable_features: true
+  - name: state_residual_v1    # fade market overreaction to a received state change
+    kind: state_residual
+  - name: market_anchor_v1     # team-strength-aware fair from frozen pregame market
+    kind: market_anchored
   - name: ai_shadow            # async Claude gate over fade_v1_frozen candidates
     kind: ai_shadow
     base: fade_v1_frozen
@@ -74,5 +91,7 @@ engine:
   paper_taker_fee_theta: 0.06   # Polymarket US taker fee coefficient
   causal_replay_latency_secs: 0.5 # first eligible BBO after decision + latency
   history_gap_reset_secs: 180     # reset rolling signals after an observation gap
+  counterfactual_max_lag_secs: 5  # do not backfill old markout horizons after downtime
+  state_model_path: null          # accepted research artifact; null keeps analytic control
   report_timezone: America/Los_Angeles # trading-day boundary, not the host timezone
   db_path: polybot.db

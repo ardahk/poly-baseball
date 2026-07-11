@@ -14,6 +14,7 @@ from .broker import PaperBroker
 from .config import Config
 from .dashboard import TerminalDashboard
 from .journal import Journal
+from .model_features import ModelHistory, state_signature
 from .models import GameState, Market, MarketQuote, Position
 from .risk import RiskManager
 from .strategies import (
@@ -24,6 +25,7 @@ from .strategies import (
     executable_bid,
 )
 from .timeframe import day_bounds
+from .state_model import load_probability_model
 from .volatility import PriceHistory
 log = logging.getLogger(__name__)
 
@@ -36,7 +38,11 @@ class Engine:
         # Frozen strategy registry drives the whole loop; `self.strategies` keeps
         # the plain names that broker / risk / journal are keyed by.
         self.strategy_objs = build_strategies(cfg)
+        self.strategy_by_name = {s.name: s for s in self.strategy_objs}
         self.strategies = [s.name for s in self.strategy_objs]
+        self.state_probability, self.state_model_label = load_probability_model(
+            cfg.engine.state_model_path
+        )
         log.info("strategies: %s", self.strategies)
 
         self.started_at = time.time()
@@ -60,6 +66,7 @@ class Engine:
 
         self.markets: dict[str, Market] = {}
         self.histories: dict[str, PriceHistory] = {}       # market_key -> home-token history
+        self.model_histories: dict[str, ModelHistory] = {}
         self.game_states: dict[int, GameState] = {}
         self.cooldowns: dict[tuple[str, str], float] = {}  # (strategy, market) -> reopen ts
         self.latest_prices: dict[str, float] = {}          # token -> price
@@ -118,6 +125,7 @@ class Engine:
         for market in self.journal.markets_by_slugs(sorted(needed)):
             self.markets[market.key] = market
             self.histories.setdefault(market.key, PriceHistory(self.cfg.strategy.flip_band))
+            self.model_histories.setdefault(market.key, self._new_model_history())
         missing = needed - set(self.markets)
         if missing:
             self._event("warning: %d restored position(s) reference unknown markets: %s",
@@ -140,8 +148,8 @@ class Engine:
         """Freeze each strategy's version + config hash for this run's provenance."""
         entries = []
         for strat in self.strategy_objs:
-            config_json = json.dumps(asdict(strat.config), sort_keys=True,
-                                     separators=(",", ":"))
+            frozen = {"strategy": asdict(strat.config), "state_model": self.state_model_label}
+            config_json = json.dumps(frozen, sort_keys=True, separators=(",", ":"))
             payload = f"{strat.kind}:{strat.version}:{config_json}"
             entries.append({
                 "strategy": strat.name, "version": strat.version, "kind": strat.kind,
@@ -165,8 +173,11 @@ class Engine:
                 # One bulk request refreshes every market's BBO per tick.
                 found, quotes = pmus.fetch_mlb_book()
                 self._maybe_discover(found)
-                self._maybe_poll_games()
+                # The bulk book is timestamped before the MLB request below.
+                # Apply it first so a pre-state quote cannot be evaluated as if
+                # it were observed after that state transition.
                 self._poll_prices(quotes)
+                self._maybe_poll_games()
                 self._manage_exits()
                 self._look_for_entries()
                 self._flush_counterfactuals()
@@ -202,6 +213,7 @@ class Engine:
                 self.markets[m.key] = m
                 self.journal.record_market(m)
                 self.histories[m.key] = PriceHistory(self.cfg.strategy.flip_band)
+                self.model_histories[m.key] = self._new_model_history()
                 self._event("tracking: %s (game %s)", m.question, m.game_pk)
 
     def _maybe_poll_games(self):
@@ -219,11 +231,41 @@ class Engine:
             gs = self.mlb.game_state(market.game_pk)
             if gs:
                 previous = self.game_states.get(market.game_pk)
-                self.game_states[market.game_pk] = gs
                 if gs != previous:
+                    for linked in self.markets.values():
+                        if linked.game_pk == gs.game_pk:
+                            model_history = self.model_histories.setdefault(
+                                linked.key, self._new_model_history()
+                            )
+                            if model_history.observe_state(gs, gs.received_at):
+                                anchored_names = {
+                                    s.name for s in self.strategy_objs
+                                    if s.kind in {"state_residual", "market_anchored"}
+                                }
+                                self.active_signals = {
+                                    key: value for key, value in self.active_signals.items()
+                                    if not (key[0] in anchored_names and key[1] == linked.key)
+                                }
+                                view = None if model_history.last_price is None else \
+                                    model_history.market_view(
+                                        model_history.last_price, gs.received_at, beta=1.0,
+                                    )
+                                quote = self.latest_quotes.get(linked.key)
+                                self.journal.record_model_observation(
+                                    model=self.state_model_label, market=linked.key,
+                                    game_state=gs,
+                                    state_signature=repr(state_signature(gs)),
+                                    model_home=model_history.current_model,
+                                    pregame_anchor=(view.anchor_price if view else None),
+                                    anchored_fair=(view.fair_home if view else None),
+                                    home_mid=model_history.last_price,
+                                    spread=(quote.home_spread if quote else None),
+                                    ts=gs.received_at, commit=False,
+                                )
+                    self.game_states[market.game_pk] = gs
                     self.journal.record_game_state(gs)
-                if gs.is_final and not (previous and previous.is_final):
-                    self._settle_final_game(gs)
+                    if gs.is_final and not (previous and previous.is_final):
+                        self._settle_final_game(gs)
 
     def _settle_final_game(self, gs: GameState) -> None:
         """Paper contracts resolve at the official final outcome, never a stale BBO."""
@@ -268,18 +310,34 @@ class Engine:
 
     def _poll_prices(self, quotes: dict[str, pmus.BookQuote]):
         wrote = False
+        now = time.time()
         for market in self.markets.values():
             gs = self.game_states.get(market.game_pk)
-            if not gs or not gs.is_live:
+            live = bool(gs and gs.is_live)
+            pregame = not live and market.start_time is not None and \
+                now >= market.start_time - self.cfg.engine.pregame_game_state_window_secs
+            if not live and not pregame:
                 continue
             book = quotes.get(market.slug)
             if book is None:
                 continue
             history = self.histories[market.key]
-            if history.samples and book.received_at - history.samples[-1][0] \
+            model_history = self.model_histories.setdefault(
+                market.key, self._new_model_history()
+            )
+            last_observed = model_history.last_price_ts
+            if last_observed is None and history.samples:
+                last_observed = history.samples[-1][0]
+            if last_observed is not None \
+                    and book.received_at - last_observed \
                     > self.cfg.engine.history_gap_reset_secs:
                 self.histories[market.key] = PriceHistory(self.cfg.strategy.flip_band)
                 history = self.histories[market.key]
+                model_history.reset_rolling()
+                if live:
+                    model_history.observe_state(gs, gs.received_at)
+                for strat in self.strategy_objs:
+                    strat.reset_market(market.key)
                 self.latest_quotes.pop(market.key, None)
                 self._event("history reset after data gap: %s", market.question)
             if book.two_sided:
@@ -304,7 +362,14 @@ class Engine:
             else:
                 self.latest_quotes.pop(market.key, None)
                 continue
-            history.add(home_mid, ts=book.received_at)
+            model_history.add_price(
+                home_mid, book.received_at,
+                pregame_eligible=(
+                    market.start_time is not None and book.received_at < market.start_time
+                ),
+            )
+            if live:
+                history.add(home_mid, ts=book.received_at)
             wrote = True
         if wrote:
             self.journal.conn.commit()
@@ -333,11 +398,13 @@ class Engine:
                 if market is None:
                     continue
                 quote = self.latest_quotes.get(market.key)
-                if quote is None or now - quote.ts > self.cfg.strategy.max_quote_age_secs:
+                if quote is None or now - quote.ts > strat.config.max_quote_age_secs \
+                        or (gs := self.game_states.get(market.game_pk)) is None \
+                        or quote.ts < gs.received_at:
                     continue
-                gs = self.game_states.get(market.game_pk)
                 ctx = StratContext(market, self.histories[market.key], gs, quote, now,
-                                   fee_theta=self.cfg.engine.paper_taker_fee_theta)
+                                   fee_theta=self.cfg.engine.paper_taker_fee_theta,
+                                   model_history=self.model_histories.get(market.key))
                 for ex in strat.manage(ctx, [pos]):
                     self._close(strat.name, ex.position, ex.price, ex.reason, fair=ex.fair)
 
@@ -358,8 +425,9 @@ class Engine:
                                       exit_kind=strategy.exit_kind(reason),
                                       fee_usd=self.broker.last_fee[strat], commit=False)
             self.journal.save_paper_state(self.broker, commit=False)
-        cooldown = self.cfg.strategy.stop_loss_cooldown_secs \
-            if reason.startswith("stop loss") else self.cfg.strategy.cooldown_secs
+        scfg = self.strategy_by_name[strat].config
+        cooldown = scfg.stop_loss_cooldown_secs \
+            if reason.startswith("stop loss") else scfg.cooldown_secs
         self.cooldowns[(strat, position.market_key)] = time.time() + cooldown
 
     # --------------------------------------------------------------- entries
@@ -386,6 +454,11 @@ class Engine:
                 history.realized_vol(self.cfg.strategy.vol_window) if history else None
             ),
             "fair_home": ev.fair_home if ev else None,
+            "anchor_price": ev.anchor_price if ev else None,
+            "anchor_model": ev.anchor_model if ev else None,
+            "model_delta": ev.model_delta if ev else None,
+            "residual": ev.residual if ev else None,
+            "anchor_age": ev.anchor_age if ev else None,
             "side": ev.side_team if ev else None,
             "price": ev.price if ev else None,
             "fair": ev.fair if ev else None,
@@ -413,15 +486,21 @@ class Engine:
             # (and we still capture the signal + counterfactuals). The quote may
             # be None (one-sided book); the price history is kept alive by marks.
             quote = self.latest_quotes.get(market.key)
+            awaiting_post_state_quote = quote is not None and quote.ts < gs.received_at
+            if awaiting_post_state_quote:
+                quote = None
             ctx = StratContext(market, self.histories[market.key], gs, quote, now,
-                               fee_theta=self.cfg.engine.paper_taker_fee_theta)
+                               fee_theta=self.cfg.engine.paper_taker_fee_theta,
+                               model_history=self.model_histories.get(market.key))
             for strat in self.strategy_objs:
                 self._evaluate_strategy(strat, ctx, gs, quote, now,
-                                        day_start, day_end, day_key, rows)
+                                        day_start, day_end, day_key, rows,
+                                        register_signal=not awaiting_post_state_quote)
         self.journal.record_decisions(rows)
 
     def _evaluate_strategy(self, strat, ctx, gs, quote, now,
-                           day_start, day_end, day_key, rows):
+                           day_start, day_end, day_key, rows,
+                           register_signal=True):
         market = ctx.market
         quote_age = None if quote is None else now - quote.ts
         d = strat.evaluate(ctx)
@@ -431,7 +510,7 @@ class Engine:
             market, gs, "strategy", d.outcome, strategy_name=strat.name,
             ev=ev, quote=quote, quote_age=quote_age, ts=now,
         ))
-        if d.signal_candidate and ev is not None and ev.signal is not None:
+        if register_signal and d.signal_candidate and ev is not None and ev.signal is not None:
             self._maybe_register_signal(strat, ctx, d)
 
         intent = d.intent
@@ -449,7 +528,7 @@ class Engine:
                 market, gs, "post_signal", "already_open", strategy_name=strat.name,
                 ev=ev, quote=quote, quote_age=quote_age, ts=now))
             return
-        stake = self._stake_for_intent(intent, quote)
+        stake = self._stake_for_intent(strat, intent, quote)
         daily_realized = self.journal.realized_pnl(strat.name, day_start, day_end)
         if not self.risk.can_open(
             self.broker, strat.name, market.key, stake,
@@ -521,6 +600,9 @@ class Engine:
             side_team=ev.side_team, entry_price=entry_price,
             fair=ev.fair, edge=edge, net_edge=net_edge, fee=fee, outcome=d.outcome,
             move=ev.move, spread=spread,
+            anchor_price=ev.anchor_price, anchor_model=ev.anchor_model,
+            model_delta=ev.model_delta, residual=ev.residual,
+            anchor_age=ev.anchor_age,
             inning=gstate.inning, is_top=int(gstate.is_top),
             home_score=gstate.home_score, away_score=gstate.away_score,
             commit=False,
@@ -540,12 +622,23 @@ class Engine:
         dirty = False
         for sig in self.pending_cf:
             due = sorted(h for h in sig["remaining"] if now - sig["born"] >= h)
+            handled: list[int] = []
             for horizon in due:
                 market = self.markets.get(sig["market_key"])
                 quote = self.latest_quotes.get(sig["market_key"])
+                target_ts = sig["born"] + horizon
+                lag = now - target_ts
+                timely = lag <= self.cfg.engine.counterfactual_max_lag_secs
+                hist = self.histories.get(sig["market_key"])
+                post_target_mark = bool(
+                    hist and hist.samples and hist.samples[-1][0] >= target_ts
+                )
                 fresh = quote is not None and \
-                    now - quote.ts <= self.cfg.strategy.max_quote_age_secs
-                if market is not None and fresh:
+                    now - quote.ts <= self.cfg.strategy.max_quote_age_secs \
+                    and quote.ts >= target_ts
+                if timely and not fresh and not post_target_mark:
+                    continue  # wait for the first observation after the target
+                if market is not None and fresh and timely:
                     bid = executable_bid(market, quote, sig["token"])
                     ask = executable_ask(market, quote, sig["token"])
                     self.journal.record_counterfactual(
@@ -553,13 +646,14 @@ class Engine:
                         mid=(bid + ask) / 2, two_sided=1, spread=ask - bid,
                         commit=False)
                 else:
-                    hist = self.histories.get(sig["market_key"])
                     self.journal.record_counterfactual(
                         sig["signal_id"], horizon, exec_bid=None, exec_ask=None,
-                        mid=hist.last if hist else None, two_sided=0, spread=None,
+                        mid=(hist.last if timely and post_target_mark else None),
+                        two_sided=0, spread=None,
                         commit=False)
+                handled.append(horizon)
                 dirty = True
-            sig["remaining"].difference_update(due)
+            sig["remaining"].difference_update(handled)
             if sig["remaining"]:
                 still.append(sig)
             else:
@@ -575,13 +669,16 @@ class Engine:
         """Executable taker buy price for a normalized token side."""
         return executable_ask(market, quote, token)
 
-    def _stake_for_intent(self, intent, quote: MarketQuote) -> float:
+    def _stake_for_intent(self, strat, intent, quote: MarketQuote) -> float:
         rcfg = self.cfg.risk
-        scfg = self.cfg.strategy
+        scfg = strat.config
         if intent.edge >= rcfg.strong_stake_min_edge \
                 and quote.home_spread <= scfg.strong_stake_max_spread:
             return rcfg.strong_stake_usd
         return rcfg.stake_usd
+
+    def _new_model_history(self) -> ModelHistory:
+        return ModelHistory(self.state_probability)
 
     # ---------------------------------------------------------------- equity
 

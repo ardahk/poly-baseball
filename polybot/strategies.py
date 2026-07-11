@@ -15,7 +15,8 @@ from . import strategy as _fade
 from .ai_judge import AIJudge
 from .broker import taker_fee
 from .config import AIConfig, StrategyConfig
-from .models import EntryEvaluation, GameState, Market, MarketQuote, Position
+from .model_features import AnchoredView, ModelHistory
+from .models import EntryEvaluation, GameState, Market, MarketQuote, Position, Signal
 from .volatility import PriceHistory
 
 # Post-signal counterfactual horizons (seconds after a candidate signal).
@@ -54,6 +55,7 @@ class StratContext:
     quote: MarketQuote | None
     now: float
     fee_theta: float = 0.0
+    model_history: ModelHistory | None = None
 
     def entry_price(self, token: str) -> float:
         return executable_ask(self.market, self.quote, token)
@@ -120,19 +122,17 @@ class Strategy:
     def close(self) -> None:            # release resources (threads, etc.)
         pass
 
+    def reset_market(self, market_key: str) -> None:
+        """Discard strategy-local transient state after a run/data boundary."""
+        pass
 
-class FadeStrategy(Strategy):
-    """The current mean-reversion fade, parameterised by a frozen config."""
-
-    def evaluate(self, ctx: StratContext) -> Decision:
-        ev = _fade.evaluate_entry(ctx.market, ctx.history, ctx.game_state, self.config)
-        if ev.signal is None:
-            return Decision(evaluation=ev, outcome=ev.outcome)
-        sig = ev.signal
+    def _gate_execution(self, ctx: StratContext, ev: EntryEvaluation,
+                        sig: Signal) -> Decision:
+        """Shared executability cascade: a signal-grade candidate becomes an
+        Intent only if a fresh two-sided book survives spread and fee gates.
+        Every path keeps signal_candidate=True so counterfactuals still capture
+        the non-executable moments."""
         cfg = self.config
-        # A signal-grade candidate exists: track it regardless of executability so
-        # counterfactuals capture even the wide-spread / stale moments where fades
-        # actually live. Only the *tradeable* path needs a fresh two-sided book.
         if ctx.quote is None:
             return Decision(evaluation=ev, outcome="no_quote", signal_candidate=True)
         if ctx.quote_age is not None and ctx.quote_age > cfg.max_quote_age_secs:
@@ -141,15 +141,26 @@ class FadeStrategy(Strategy):
             return Decision(evaluation=ev, outcome="wide_spread", signal_candidate=True)
         exec_price = ctx.entry_price(sig.token)
         fee = ctx.round_trip_fee(exec_price, sig.fair)
-        edge = sig.fair - exec_price - fee
-        if edge < cfg.min_edge:
+        net_edge = sig.fair - exec_price - fee
+        if net_edge < cfg.min_edge:
+            ev.margin = net_edge - cfg.min_edge
             return Decision(evaluation=ev, outcome="execution_cost",
                             signal_candidate=True)
         intent = Intent(token=sig.token, side_team=sig.side_team,
                         signal_price=sig.price, fair=sig.fair, move=sig.move,
-                        edge=edge, reason=sig.reason, evaluation=ev)
+                        edge=net_edge, reason=sig.reason, evaluation=ev)
         return Decision(evaluation=ev, outcome="signal", intent=intent,
                         signal_candidate=True)
+
+
+class FadeStrategy(Strategy):
+    """The current mean-reversion fade, parameterised by a frozen config."""
+
+    def evaluate(self, ctx: StratContext) -> Decision:
+        ev = _fade.evaluate_entry(ctx.market, ctx.history, ctx.game_state, self.config)
+        if ev.signal is None:
+            return Decision(evaluation=ev, outcome=ev.outcome)
+        return self._gate_execution(ctx, ev, ev.signal)
 
     def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
         gs = ctx.game_state
@@ -166,6 +177,141 @@ class FadeStrategy(Strategy):
             if reason:
                 out.append(ExitIntent(position=pos, price=price, reason=reason, fair=fair))
         return out
+
+
+class AnchoredStrategy(Strategy):
+    """Base for strategies that trade model *changes*, not model level.
+
+    The model update is transferred onto either the immediately preceding
+    state price or a frozen pregame market price. All remaining execution and
+    fee gates match the frozen fade control.
+    """
+
+    view_kind = "state"
+
+    def _view(self, ctx: StratContext) -> AnchoredView | None:
+        if ctx.model_history is None or ctx.history.last is None:
+            return None
+        if self.view_kind == "state":
+            return ctx.model_history.state_view(
+                ctx.history.last, ctx.now, self.config.residual_beta,
+            )
+        return ctx.model_history.market_view(
+            ctx.history.last, ctx.now, self.config.residual_beta,
+        )
+
+    def _max_age(self) -> float:
+        return self.config.residual_response_secs if self.view_kind == "state" \
+            else self.config.market_anchor_max_age_secs
+
+    def evaluate(self, ctx: StratContext) -> Decision:
+        history = ctx.history
+        mid = history.last
+        base = {
+            "mid": mid,
+            "flips": history.flips,
+            "realized_vol": history.realized_vol(self.config.vol_window),
+        }
+        if ctx.game_state is None or not ctx.game_state.is_live:
+            return Decision(EntryEvaluation(outcome="not_live", **base), "not_live")
+        if mid is None:
+            return Decision(EntryEvaluation(outcome="no_price", **base), "no_price")
+        view = self._view(ctx)
+        if view is None:
+            outcome = "state_warmup" if self.view_kind == "state" else "no_pregame_anchor"
+            return Decision(EntryEvaluation(outcome=outcome, **base), outcome)
+        detail = {
+            **base,
+            "move": view.market_delta,
+            "fair_home": view.fair_home,
+            "anchor_price": view.anchor_price,
+            "anchor_model": view.anchor_model,
+            "model_delta": view.model_delta,
+            "residual": view.residual,
+            "anchor_age": view.anchor_age,
+        }
+        if view.anchor_age > self._max_age():
+            ev = EntryEvaluation(
+                outcome="anchor_stale", margin=self._max_age() - view.anchor_age,
+                **detail,
+            )
+            return Decision(ev, ev.outcome)
+        if abs(view.model_delta) < self.config.residual_min_model_delta:
+            ev = EntryEvaluation(
+                outcome="small_model_move",
+                margin=abs(view.model_delta) - self.config.residual_min_model_delta,
+                **detail,
+            )
+            return Decision(ev, ev.outcome)
+        if abs(view.residual) < self.config.residual_threshold:
+            ev = EntryEvaluation(
+                outcome="small_residual",
+                margin=abs(view.residual) - self.config.residual_threshold,
+                **detail,
+            )
+            return Decision(ev, ev.outcome)
+
+        market = ctx.market
+        if view.residual < 0:
+            token, team, price, fair = (
+                market.home_token, market.home_team, mid, view.fair_home,
+            )
+        else:
+            token, team, price, fair = (
+                market.away_token, market.away_team, 1.0 - mid, 1.0 - view.fair_home,
+            )
+        edge = fair - price
+        signal = Signal(
+            market=market, token=token, side_team=team, price=price, fair=fair,
+            move=view.market_delta,
+            reason=(
+                f"{self.kind} residual {view.residual:+.3f}; "
+                f"model delta {view.model_delta:+.3f}; "
+                f"anchored fair {view.fair_home:.3f}"
+            ),
+        )
+        ev = EntryEvaluation(
+            outcome="signal", side_team=team, price=price, fair=fair, edge=edge,
+            margin=edge - self.config.min_edge, signal=signal, **detail,
+        )
+        if not (self.config.min_price <= price <= self.config.max_price):
+            ev.outcome = "price_band"
+            ev.margin = price - self.config.min_price if price < self.config.min_price \
+                else self.config.max_price - price
+            return Decision(ev, ev.outcome, signal_candidate=True)
+        return self._gate_execution(ctx, ev, signal)
+
+    def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
+        view = self._view(ctx)
+        out: list[ExitIntent] = []
+        for pos in positions:
+            price = ctx.exit_price(pos.token)
+            fair = None
+            if view is not None:
+                fair = view.fair_home if pos.token == ctx.market.home_token \
+                    else 1.0 - view.fair_home
+            reason = _fade.check_exit(
+                pos, price, fair,
+                bool(ctx.game_state and ctx.game_state.is_final), self.config,
+                now=ctx.now, fee_theta=ctx.fee_theta,
+            )
+            if reason:
+                out.append(ExitIntent(pos, price, reason, fair))
+        return out
+
+
+class StateResidualStrategy(AnchoredStrategy):
+    """Fade a short-lived market miss after a newly received game state."""
+
+    kind = "state_residual"
+    view_kind = "state"
+
+
+class MarketAnchoredStrategy(AnchoredStrategy):
+    """Value strategy anchored to the last pregame market probability."""
+
+    kind = "market_anchored"
+    view_kind = "market"
 
 
 class AIShadowStrategy(Strategy):
@@ -240,6 +386,10 @@ DEFAULT_REGISTRY = [
     {"name": "fade_v1_frozen", "kind": "fade"},
     {"name": "fade_tight", "kind": "fade",
      "overrides": {"move_threshold": 0.15, "min_edge": 0.09}},
+    {"name": "liquidity_fade_v2", "kind": "fade",
+     "overrides": {"sampling_stable_features": True}},
+    {"name": "state_residual_v1", "kind": "state_residual"},
+    {"name": "market_anchor_v1", "kind": "market_anchored"},
     {"name": "ai_shadow", "kind": "ai_shadow", "base": "fade_v1_frozen"},
 ]
 
@@ -254,6 +404,11 @@ def build_strategies(cfg) -> list[Strategy]:
         if kind == "fade":
             sconf = dataclasses.replace(cfg.strategy, **entry.get("overrides", {}))
             strats.append(FadeStrategy(name, entry.get("version", "v1"), sconf))
+        elif kind in {"state_residual", "market_anchored"}:
+            sconf = dataclasses.replace(cfg.strategy, **entry.get("overrides", {}))
+            cls = StateResidualStrategy if kind == "state_residual" \
+                else MarketAnchoredStrategy
+            strats.append(cls(name, entry.get("version", "v1"), sconf))
         elif kind == "ai_shadow":
             if not cfg.ai.enabled:
                 continue

@@ -45,17 +45,24 @@ def evaluate_entry(
     are near-miss rejections; positive values passed that gate.
     """
     mid = history.last
-    realized_vol = history.realized_vol(cfg.vol_window)
+    if cfg.sampling_stable_features:
+        realized_vol = history.realized_vol_time(
+            cfg.feature_window_secs, cfg.feature_bucket_secs,
+        )
+        flips = history.flips_within(cfg.flip_window_secs)
+    else:
+        realized_vol = history.realized_vol(cfg.vol_window)
+        flips = history.flips
     base = {
         "mid": mid,
-        "flips": history.flips,
+        "flips": flips,
         "realized_vol": realized_vol,
     }
     if game_state is None or not game_state.is_live:
         return EntryEvaluation(outcome="not_live", **base)
     if mid is None:
         return EntryEvaluation(outcome="no_price", **base)
-    if not history.is_playful(cfg.min_flips, cfg.min_volatility, cfg.vol_window):
+    if flips < cfg.min_flips and realized_vol < cfg.min_volatility:
         return EntryEvaluation(
             outcome="not_playful",
             margin=realized_vol - cfg.min_volatility,

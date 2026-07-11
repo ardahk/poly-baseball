@@ -142,7 +142,9 @@ def test_records_signal_and_counterfactuals(tmp_path):
     sid = j.record_signal(strategy="fade_v1_frozen", market="m1", token="m1:LONG",
                           side_team="Homers", entry_price=0.41, fair=0.55, edge=0.14,
                           move=-0.10, spread=0.02, inning=7, is_top=1,
-                          home_score=4, away_score=1)
+                          home_score=4, away_score=1, anchor_price=0.50,
+                          anchor_model=0.54, model_delta=0.10, residual=-0.05,
+                          anchor_age=12.0)
     assert isinstance(sid, int)
     j.record_counterfactual(sid, horizon_secs=30, exec_bid=0.44, exec_ask=0.46,
                             mid=0.45, two_sided=1, spread=0.02)
@@ -154,4 +156,24 @@ def test_records_signal_and_counterfactuals(tmp_path):
     sig = j.conn.execute("SELECT * FROM signals WHERE id=?", (sid,)).fetchone()
     assert sig["strategy"] == "fade_v1_frozen"
     assert sig["run_id"] is not None
+    assert sig["anchor_price"] == 0.50
+    assert sig["residual"] == -0.05
+    j.close()
+
+
+def test_records_one_model_observation_per_distinct_state(tmp_path):
+    j = Journal(str(tmp_path / "model.db"))
+    j.start_run("paper", "hash")
+    gs = GameState(7, inning=3, outs=1, home_score=1, away_score=0, status="Live")
+    kwargs = dict(
+        model="analytic_v1", market="m1", game_state=gs,
+        state_signature="state-1", model_home=0.62, pregame_anchor=0.55,
+        anchored_fair=0.64, home_mid=0.60, spread=0.02, ts=100.0,
+    )
+    j.record_model_observation(**kwargs)
+    j.record_model_observation(**kwargs)
+    rows = j.conn.execute("SELECT * FROM model_observations").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["pregame_anchor"] == 0.55
+    assert rows[0]["anchored_fair"] == 0.64
     j.close()

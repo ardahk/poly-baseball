@@ -5,11 +5,16 @@ when a "playful" game's price swings hard and a win-probability model
 (inning / outs / bases / score) says the move overshot, the bot buys the
 undervalued side, targeting small gains (default +12% take profit, -30% stop).
 
-Two strategies run side-by-side with separate ledgers so you can compare them:
+Several frozen strategies run side-by-side with separate paper ledgers:
 
-- **math** — pure formula: playfulness filter + sharp move + model edge
-- **ai** — the same signals, but each one must also be approved by a Claude
-  judge (`claude-opus-4-8`) before it trades
+- **fade_v1_frozen / fade_tight** — original absolute-model fade controls.
+- **liquidity_fade_v2** — the unchanged-book shock control with volatility and
+  regime crossings measured on fixed receipt-time windows.
+- **state_residual_v1** — fades a short-lived market overreaction relative to
+  the latest distinct MLB state change.
+- **market_anchor_v1** — freezes the pregame market probability, then transfers
+  model changes onto it in log-odds space so team-strength bias largely cancels.
+- **ai_shadow** — asynchronous, optional judge over the frozen fade control.
 
 ## Setup
 
@@ -34,13 +39,27 @@ Keys (all optional to start):
 python main.py scan          # what MLB markets exist right now + model fair values
 python main.py run           # paper trade (default, no keys needed)
 python main.py run --dashboard # paper trade with a live terminal dashboard
-python main.py report        # math-vs-AI performance comparison
+python main.py report        # frozen-strategy performance comparison
 python main.py review        # end-of-day trade/funnel/near-miss review
 python main.py run --live    # intentionally disabled during Phase 0
 
 python main.py backtest calibrate --days 7   # is the win-prob formula accurate?
 python main.py backtest strategy  --days 1   # would the trading logic have profited?
 python main.py backtest causal --date 2026-07-08
+python main.py research diagnose --date 2026-07-08
+
+# Offline Phase 3 model research; writes only if the untouched holdout improves.
+python main.py research fit-state --seasons 2022 2023 2024 --holdout 2025 \
+  --output artifacts/state-model-v1.json
+
+# Phase 4 is deliberately two-step. Prepare hashes the config and immutable
+# tape without computing results; evaluate verifies that lock before reveal.
+python main.py walk-forward prepare --start 2026-05-01 --folds 4 \
+  --hypothesis "state-residual fades have positive after-cost expectancy" \
+  --output artifacts/walk-forward-prereg.json
+python main.py walk-forward evaluate \
+  --manifest artifacts/walk-forward-prereg.json \
+  --output artifacts/walk-forward-result.json
 ```
 
 Run it during live MLB games (evenings US time); outside game hours there is
@@ -68,6 +87,9 @@ Runtime paper fills use the executable BBO side (buy at ask, sell at bid) and
 the configured Polymarket US taker-fee coefficient. One-sided marks are recorded
 for research but cannot trigger an entry or exit. New events are linked to an
 immutable run ID plus configuration hash in the journal.
+Phase 3 also records one `model_observations` row per distinct received game
+state, rather than treating thousands of correlated price ticks as independent
+calibration samples.
 
 The first command that opens an older `polybot.db` migrates it in place. The
 migration is additive, but copy the DB aside first if it contains data you care
@@ -120,6 +142,43 @@ Two ways to validate the math on **real finished games** before risking money:
   official settlement are enforced portfolio-wide. Async AI shadows are skipped
   because external model calls are not deterministic historical evidence.
 
+## Phase 3 model research
+
+The state-residual and market-anchored families use causal model deltas. The
+state-residual anchor is the last price known before a changed MLB state was
+received. The market anchor is the last valid pregame price and is frozen when
+the first live state arrives. A quote observed with or after a state update can
+never become that update's prior anchor.
+
+`research fit-state` builds a beta-smoothed empirical state table from declared
+training seasons and scores it against both outcomes and the analytic control
+on one untouched holdout season. It refuses to write an artifact if either
+Brier score or log loss regresses. Set `engine.state_model_path` only after an
+artifact is accepted; leaving it null preserves the analytic control.
+
+`research diagnose` reports executable post-signal markouts, BBO coverage, and
+residuals by frozen strategy and horizon. It uses the future bid and both taker
+fees—not midpoint—to avoid manufacturing paper edge. Parameter selection and
+automatic strategy promotion use the preregistered Phase 4 walk-forward gate.
+
+## Phase 4 walk-forward testing
+
+`walk-forward prepare` creates weekly chronological folds with 28 training
+days, 7 validation days, and a following locked 7-day test. It stores the
+hypothesis, deterministic validation selection rule, promotion thresholds,
+config hash, code revision, timezone, exact boundaries, and a hash of every
+market/game event in scope. Existing manifests are never overwritten.
+
+`walk-forward evaluate` refuses to run if the manifest, config, or event tape
+changed. Within each fold it selects the strategy with the best validation net
+P&L before evaluating the locked test. The write-once result includes after-cost
+P&L, return on deployed capital, drawdown, daily expected shortfall, fill/fee
+rates, executable-bid adverse selection at 5, 15, 30, and 60 seconds,
+game-clustered calibration losses and confidence intervals, day/game P&L
+confidence intervals, and concentration by day, game, inning, entry-price
+bucket, and spread bucket. Promotion checks apply only to the strategy selected
+before each locked test; challenger results remain visible for auditability.
+
 ## How it works
 
 - **Market discovery**: Polymarket US sports gateway (`/v2/leagues/mlb/events`),
@@ -128,10 +187,12 @@ Two ways to validate the math on **real finished games** before risking money:
   Every two-sided BBO tick is recorded with `two_sided=1, source='bbo'`; when a
   live book is one-sided, the mark/last price is recorded with
   `two_sided=0, source='mark'` so replay sees the same price history the live
-  strategy saw. To avoid noisy API usage, price polling only starts once MLB
-  reports a game as live; game-state checks begin shortly before first pitch.
-- **Fair value**: normal model of the final run differential using a
-  run-expectancy (RE24) adjustment for the current base/out state.
+  strategy saw. During the configured pregame window, BBOs are recorded so the
+  market-anchored strategy can freeze the last valid pre-first-pitch prior;
+  trading features themselves begin only once MLB reports the game as live.
+- **Fair value**: analytic or accepted empirical state probability. Phase 3
+  strategies consume its state-to-state change, transferred onto a causal
+  market anchor, rather than pretending the absolute formula knows team strength.
 - **Playfulness**: only trades games whose price has crossed 50% repeatedly
   (with hysteresis) or shows high realized volatility — the "crossing lines"
   pattern, not one team cruising.

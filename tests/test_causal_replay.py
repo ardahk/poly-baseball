@@ -145,3 +145,75 @@ def test_run_boundary_clears_pending_orders(monkeypatch, tmp_path):
     assert report.results[0].open_positions == 0
     journal.close()
 
+
+def test_tied_final_cancels_pending_orders_without_settling(monkeypatch, tmp_path):
+    path = tmp_path / "tie.db"
+    cfg = _cfg(path)
+    base = _base()
+    market = _market()
+    journal = Journal(str(path))
+    journal.start_run("paper", "cfg")
+    journal.record_market(market, ts=base)
+    journal.record_game_state(_state(1, base - 1), ts=base - 1)
+    journal.record_price(market, _quote(market, base, 0.49, 0.51))
+    journal.record_game_state(
+        _state(1, base + 0.25, "Final", home=1, away=1), ts=base + 0.25)
+    journal.record_price(market, _quote(market, base + 1, 0.49, 0.51))
+    monkeypatch.setattr(causal_replay, "build_strategies",
+                        lambda cfg: [AlwaysHomeStrategy("always", "v1", cfg.strategy)])
+
+    report = causal_replay.CausalReplay(cfg, journal, base - 10, base + 10, "day").run()
+
+    assert report.trades == []  # the pending entry was cancelled, never filled
+    assert report.results[0].open_positions == 0
+    journal.close()
+
+
+def test_data_gap_preserves_frozen_pregame_anchor(monkeypatch, tmp_path):
+    path = tmp_path / "gap-anchor.db"
+    cfg = _cfg(path)
+    base = _base()
+    market = _market()
+    market.start_time = base - 1.5  # scheduled first pitch
+    journal = Journal(str(path))
+    journal.start_run("paper", "cfg")
+    journal.record_market(market, ts=base - 3)
+    journal.record_price(market, _quote(market, base - 2, 0.43, 0.45))  # pregame
+    journal.record_game_state(_state(1, base - 1), ts=base - 1)
+    journal.record_price(market, _quote(market, base, 0.49, 0.51))
+    resume = base + cfg.engine.history_gap_reset_secs + 60
+    journal.record_price(market, _quote(market, resume, 0.54, 0.56))
+    monkeypatch.setattr(causal_replay, "build_strategies",
+                        lambda cfg: [AlwaysHomeStrategy("always", "v1", cfg.strategy)])
+
+    replay = causal_replay.CausalReplay(cfg, journal, base - 10, resume + 10, "day")
+    replay.run()
+
+    history = replay.model_histories[market.key]
+    assert history.pregame_anchor is not None      # frozen prior survived the gap
+    assert history.pregame_anchor.price == 0.44    # pregame midpoint
+    assert history.transition_anchor is None       # rolling state was discarded
+    journal.close()
+
+
+def test_state_change_during_latency_rejects_pending_entry(monkeypatch, tmp_path):
+    path = tmp_path / "state-change.db"
+    cfg = _cfg(path)
+    base = _base()
+    market = _market()
+    journal = Journal(str(path))
+    journal.start_run("paper", "cfg")
+    journal.record_market(market, ts=base)
+    journal.record_game_state(_state(1, base - 1), ts=base - 1)
+    journal.record_price(market, _quote(market, base, 0.49, 0.51))
+    changed = GameState(1, inning=2, status="Live", received_at=base + 0.25)
+    journal.record_game_state(changed, ts=base + 0.25)
+    journal.record_price(market, _quote(market, base + 1, 0.49, 0.51))
+    monkeypatch.setattr(causal_replay, "build_strategies",
+                        lambda cfg: [AlwaysHomeStrategy("always", "v1", cfg.strategy)])
+
+    report = causal_replay.CausalReplay(cfg, journal, base - 10, base + 10, "day").run()
+
+    assert report.trades == []
+    assert report.results[0].rejected_orders == 1
+    journal.close()

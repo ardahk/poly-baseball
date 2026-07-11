@@ -113,6 +113,11 @@ class EntryEvaluation:
     flips: int = 0
     realized_vol: float = 0.0
     fair_home: float | None = None
+    anchor_price: float | None = None
+    anchor_model: float | None = None
+    model_delta: float | None = None
+    residual: float | None = None
+    anchor_age: float | None = None
     side_team: str = ""
     price: float | None = None
     fair: float | None = None

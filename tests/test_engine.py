@@ -153,7 +153,7 @@ def _seed_fade_signal(engine, market, now):
     """Seed a playful, sharply-down home price so the fade wants the home token."""
     engine.game_states[market.game_pk] = GameState(
         market.game_pk, status="Live", inning=7, is_top=True,
-        home_score=4, away_score=1)
+        home_score=4, away_score=1, received_at=now - 200)
     history = engine.histories[market.key]
     for offset, price in [(-100, 0.62), (-75, 0.38), (-50, 0.62), (-25, 0.55), (0, 0.40)]:
         history.add(price, ts=now + offset)
@@ -174,6 +174,65 @@ def test_stale_quote_blocks_trade_but_still_records_signal(tmp_path):
     outcome = engine.journal.conn.execute(
         "SELECT outcome FROM signals WHERE strategy='fade_v1_frozen'").fetchone()
     assert outcome["outcome"] == "stale_quote"  # signal captured despite stale book
+
+
+def test_quote_received_before_state_cannot_fill_under_new_state(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    now = time.time()
+    _seed_fade_signal(engine, market, now)
+    engine.game_states[market.game_pk].received_at = now
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.39, 0.41, 0.39, 0.41, ts=now - 1,
+    )
+
+    engine._look_for_entries()
+
+    assert engine.broker.open_positions("fade_v1_frozen") == []
+    outcome = engine.journal.conn.execute(
+        "SELECT outcome FROM decisions WHERE strategy='fade_v1_frozen' "
+        "ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    assert outcome["outcome"] == "no_quote"
+
+
+def test_pre_state_candidate_does_not_consume_executable_signal_episode(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    now = time.time()
+    _seed_fade_signal(engine, market, now)
+    engine.game_states[market.game_pk].received_at = now
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.39, 0.41, 0.39, 0.41, ts=now - 1,
+    )
+    engine._look_for_entries()
+    assert engine.journal.conn.execute(
+        "SELECT COUNT(*) FROM signals WHERE strategy='fade_v1_frozen'"
+    ).fetchone()[0] == 0
+
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.39, 0.41, 0.39, 0.41, ts=time.time(),
+    )
+    engine._look_for_entries()
+    signal = engine.journal.conn.execute(
+        "SELECT entry_price FROM signals WHERE strategy='fade_v1_frozen'"
+    ).fetchone()
+    assert signal["entry_price"] == 0.41
+
+
+def test_unchanged_game_poll_preserves_distinct_state_receipt_time(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    previous = GameState(1, inning=3, status="Live", received_at=100.0)
+    engine.game_states[market.game_pk] = previous
+    engine.mlb.game_state = lambda game_pk: GameState(
+        1, inning=3, status="Live", received_at=999.0,
+    )
+
+    engine._maybe_poll_games()
+
+    assert engine.game_states[market.game_pk] is previous
+    assert engine.game_states[market.game_pk].received_at == 100.0
 
 
 def test_discovery_only_tracks_matched_markets(tmp_path):
@@ -338,4 +397,68 @@ def test_counterfactuals_recorded_after_horizon(tmp_path):
     assert row["horizon_secs"] == 30
     assert row["exec_ask"] == 0.52
     assert row["two_sided"] == 1
+    assert engine.pending_cf == []
+
+
+def test_overdue_counterfactual_is_unavailable_not_backfilled(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.70, 0.72, 0.70, 0.72, ts=time.time()
+    )
+    sid = engine.journal.record_signal(
+        strategy="fade_v1_frozen", market=market.key, token=market.home_token,
+        side_team="Homers", entry_price=0.52, fair=0.6, edge=0.08, move=-0.1,
+        spread=0.02, inning=7, is_top=1, home_score=4, away_score=1,
+    )
+    engine.pending_cf.append({
+        "signal_id": sid, "token": market.home_token,
+        "market_key": market.key, "born": time.time() - 100,
+        "remaining": {30},
+    })
+
+    engine._flush_counterfactuals()
+
+    row = engine.journal.conn.execute(
+        "SELECT * FROM signal_counterfactuals WHERE signal_id=?", (sid,)
+    ).fetchone()
+    assert row["two_sided"] == 0
+    assert row["exec_bid"] is None
+    assert row["mid"] is None
+
+
+def test_counterfactual_waits_for_first_post_target_observation(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    now = time.time()
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.50, 0.52, 0.50, 0.52, ts=now - 0.2,
+    )
+    engine.histories[market.key].add(0.51, ts=now - 0.2)
+    sid = engine.journal.record_signal(
+        strategy="fade_v1_frozen", market=market.key, token=market.home_token,
+        side_team="Homers", entry_price=0.52, fair=0.6, edge=0.08, move=-0.1,
+        spread=0.02, inning=7, is_top=1, home_score=4, away_score=1,
+    )
+    engine.pending_cf.append({
+        "signal_id": sid, "token": market.home_token,
+        "market_key": market.key, "born": now - 30.1, "remaining": {30},
+    })
+
+    engine._flush_counterfactuals()
+    assert engine.pending_cf[0]["remaining"] == {30}
+    assert engine.journal.conn.execute(
+        "SELECT COUNT(*) FROM signal_counterfactuals WHERE signal_id=?", (sid,)
+    ).fetchone()[0] == 0
+
+    observed = time.time()
+    engine.latest_quotes[market.key] = MarketQuote(
+        market.key, 0.53, 0.55, 0.53, 0.55, ts=observed,
+    )
+    engine.histories[market.key].add(0.54, ts=observed)
+    engine._flush_counterfactuals()
+    row = engine.journal.conn.execute(
+        "SELECT * FROM signal_counterfactuals WHERE signal_id=?", (sid,)
+    ).fetchone()
+    assert row["exec_bid"] == 0.53
     assert engine.pending_cf == []

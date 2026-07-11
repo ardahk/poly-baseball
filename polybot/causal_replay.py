@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from .broker import PaperBroker
 from .config import Config
 from .journal import Journal
+from .model_features import ModelHistory, state_signature
 from .models import GameState, Market, MarketQuote
 from .risk import RiskManager
 from .strategies import (
@@ -22,6 +23,7 @@ from .strategies import (
     build_strategies, executable_ask, executable_bid,
 )
 from .timeframe import day_bounds
+from .state_model import load_probability_model
 from .volatility import PriceHistory
 
 
@@ -42,17 +44,23 @@ class PendingOrder:
     action: str
     due: float
     intent: Intent | ExitIntent
+    state_signature: tuple | None = None
 
 
 @dataclass
 class ReplayTrade:
     strategy: str
     market: str
+    game_pk: int | None
+    token: str
     team: str
     entry_ts: float
     exit_ts: float
     entry_price: float
     exit_price: float
+    qty: float
+    entry_spread: float
+    entry_inning: int
     pnl_usd: float
     fees_usd: float
     exit_reason: str
@@ -69,6 +77,10 @@ class StrategyResult:
     max_drawdown: float
     open_positions: int
     rejected_orders: int
+    filled_entries: int
+    rejected_entries: int
+    rejected_exits: int
+    deployed_capital: float
 
 
 @dataclass
@@ -80,6 +92,8 @@ class ReplayReport:
     skipped_strategies: list[str]
     trades: list[ReplayTrade]
     results: list[StrategyResult]
+    starting_cash: float
+    state_model: str = "analytic_v1"
 
 
 class CausalReplay:
@@ -89,6 +103,9 @@ class CausalReplay:
         self.start = start
         self.end = end
         self.label = label
+        self.state_probability, self.state_model_label = load_probability_model(
+            cfg.engine.state_model_path
+        )
         built = build_strategies(cfg)
         self.strategies = [s for s in built if not isinstance(s, AIShadowStrategy)]
         self.skipped = [s.name for s in built if isinstance(s, AIShadowStrategy)]
@@ -107,6 +124,7 @@ class CausalReplay:
             if market.game_pk:
                 self.by_game[market.game_pk].append(market)
         self.histories: dict[str, PriceHistory] = {}
+        self.model_histories: dict[str, ModelHistory] = {}
         self.last_price_ts: dict[str, float] = {}
         self.game_states: dict[int, GameState] = {}
         self.latest_quotes: dict[str, MarketQuote] = {}
@@ -117,6 +135,10 @@ class CausalReplay:
         self.open_meta: dict[str, dict] = {}
         self.trades: list[ReplayTrade] = []
         self.rejected: dict[str, int] = defaultdict(int)
+        self.filled_entries: dict[str, int] = defaultdict(int)
+        self.rejected_entries: dict[str, int] = defaultdict(int)
+        self.rejected_exits: dict[str, int] = defaultdict(int)
+        self.deployed_capital: dict[str, float] = defaultdict(float)
         self.peak = {name: cfg.risk.starting_cash for name in names}
         self.max_drawdown = {name: 0.0 for name in names}
         self.current_source_run: str | None = None
@@ -146,12 +168,18 @@ class CausalReplay:
                 max_drawdown=self.max_drawdown[name],
                 open_positions=len(self.broker.open_positions(name)),
                 rejected_orders=self.rejected[name],
+                filled_entries=self.filled_entries[name],
+                rejected_entries=self.rejected_entries[name],
+                rejected_exits=self.rejected_exits[name],
+                deployed_capital=self.deployed_capital[name],
             ))
             strat.close()
         return ReplayReport(
             label=self.label, timezone=self.cfg.engine.report_timezone,
             events=len(events), run_boundaries=self.run_boundaries,
             skipped_strategies=self.skipped, trades=self.trades, results=results,
+            starting_cash=self.cfg.risk.starting_cash,
+            state_model=self.state_model_label,
         )
 
     def _load_events(self) -> list[TapeEvent]:
@@ -201,11 +229,15 @@ class CausalReplay:
         self.current_source_run = run_id
         self.run_boundaries += 1
         self.histories.clear()
+        self.model_histories.clear()
         self.last_price_ts.clear()
         self.game_states.clear()
         self.latest_quotes.clear()
         self.pending.clear()
         self.cooldowns.clear()
+        for strat in self.strategies:
+            for market_key in self.markets:
+                strat.reset_market(market_key)
 
     def _on_state(self, event: TapeEvent) -> None:
         row = event.payload
@@ -216,10 +248,17 @@ class CausalReplay:
             on_third=bool(row["on_third"]), status=row["status"], received_at=event.ts,
         )
         self.game_states[gs.game_pk] = gs
-        if not gs.is_final or gs.home_score == gs.away_score:
+        for market in self.by_game.get(gs.game_pk, []):
+            self.model_histories.setdefault(
+                market.key, self._new_model_history()
+            ).observe_state(gs, event.ts)
+        if not gs.is_final:
             return
         for market in self.by_game.get(gs.game_pk, []):
             self._cancel_market_orders(market.key)
+        if gs.home_score == gs.away_score:
+            return  # suspended/tied final: nothing tradeable, but leave it unsettled
+        for market in self.by_game.get(gs.game_pk, []):
             home_won = gs.home_score > gs.away_score
             for strat in self.strategies:
                 for pos in list(self.broker.open_positions(strat.name)):
@@ -241,13 +280,33 @@ class CausalReplay:
         last = self.last_price_ts.get(market.key)
         if last is not None and event.ts - last > self.cfg.engine.history_gap_reset_secs:
             self.histories.pop(market.key, None)
+            stale = self.model_histories.get(market.key)
+            if stale is not None:
+                stale.reset_rolling()
             self.latest_quotes.pop(market.key, None)
             self._cancel_market_orders(market.key)
+            for strat in self.strategies:
+                strat.reset_market(market.key)
         self.last_price_ts[market.key] = event.ts
         history = self.histories.setdefault(
             market.key, PriceHistory(self.cfg.strategy.flip_band)
         )
-        history.add(row["home_mid"], event.ts)
+        model_history = self.model_histories.setdefault(
+            market.key, self._new_model_history()
+        )
+        if model_history.current_signature is None:
+            gs = self.game_states.get(market.game_pk)
+            if gs is not None:
+                model_history.observe_state(gs, gs.received_at)
+        model_history.add_price(
+            row["home_mid"], event.ts,
+            pregame_eligible=(
+                market.start_time is not None and event.ts < market.start_time
+            ),
+        )
+        gs = self.game_states.get(market.game_pk)
+        if gs and gs.is_live:
+            history.add(row["home_mid"], event.ts)
         if not row["two_sided"]:
             self.latest_quotes.pop(market.key, None)
             return
@@ -259,12 +318,12 @@ class CausalReplay:
         self.latest_bids[market.home_token] = quote.home_bid
         self.latest_bids[market.away_token] = 1.0 - quote.home_ask
         self._fill_due(market, quote, event.ts)
-        gs = self.game_states.get(market.game_pk)
         if not gs or not gs.is_live:
             return
         for strat in self.strategies:
             ctx = StratContext(market, history, gs, quote, event.ts,
-                               fee_theta=self.cfg.engine.paper_taker_fee_theta)
+                               fee_theta=self.cfg.engine.paper_taker_fee_theta,
+                               model_history=model_history)
             positions = [p for p in self.broker.open_positions(strat.name)
                          if p.market_key == market.key]
             for exit_intent in strat.manage(ctx, positions):
@@ -272,6 +331,7 @@ class CausalReplay:
                 self.pending.setdefault(key, PendingOrder(
                     strat, market.key, "exit",
                     event.ts + self.cfg.engine.causal_replay_latency_secs, exit_intent,
+                    state_signature(gs),
                 ))
             decision = strat.evaluate(ctx)
             if decision.intent is None:
@@ -284,6 +344,7 @@ class CausalReplay:
             self.pending[key] = PendingOrder(
                 strat, market.key, "entry",
                 event.ts + self.cfg.engine.causal_replay_latency_secs, decision.intent,
+                state_signature(gs),
             )
 
     def _fill_due(self, market: Market, quote: MarketQuote, now: float) -> None:
@@ -301,8 +362,10 @@ class CausalReplay:
         strat = order.strategy
         intent = order.intent
         gs = self.game_states.get(market.game_pk)
-        if not gs or not gs.is_live or quote.home_spread > strat.config.max_spread:
+        if not gs or not gs.is_live or state_signature(gs) != order.state_signature \
+                or quote.home_spread > strat.config.max_spread:
             self.rejected[strat.name] += 1
+            self.rejected_entries[strat.name] += 1
             return
         price = executable_ask(market, quote, intent.token)
         fee_per_contract = StratContext(
@@ -313,6 +376,7 @@ class CausalReplay:
         if price < strat.config.min_price or price > strat.config.max_price \
                 or net_edge < strat.config.min_edge:
             self.rejected[strat.name] += 1
+            self.rejected_entries[strat.name] += 1
             return
         day_key = self._day_key(now)
         stake = self.cfg.risk.strong_stake_usd if (
@@ -324,14 +388,21 @@ class CausalReplay:
             daily_realized=self.daily_pnl[(day_key, strat.name)], day_key=day_key,
         ):
             self.rejected[strat.name] += 1
+            self.rejected_entries[strat.name] += 1
             return
         pos = self.broker.open(strat.name, market.key, intent.token,
                                intent.side_team, price, stake)
         if pos is None:
             self.rejected[strat.name] += 1
+            self.rejected_entries[strat.name] += 1
             return
         pos.opened_at = now
-        self.open_meta[pos.trade_id] = {"entry_ts": now, "entry_fee": pos.entry_fee}
+        self.filled_entries[strat.name] += 1
+        self.deployed_capital[strat.name] += pos.cost
+        self.open_meta[pos.trade_id] = {
+            "entry_ts": now, "entry_fee": pos.entry_fee,
+            "entry_spread": quote.home_spread, "entry_inning": gs.inning,
+        }
 
     def _fill_exit(self, order: PendingOrder, market: Market,
                    quote: MarketQuote, now: float) -> None:
@@ -343,6 +414,7 @@ class CausalReplay:
         result = self.broker.close(order.strategy.name, current.token, price)
         if result is None:
             self.rejected[order.strategy.name] += 1
+            self.rejected_exits[order.strategy.name] += 1
             return
         position, fill, pnl = result
         exit_fee = self.broker.last_fee[order.strategy.name]
@@ -355,11 +427,17 @@ class CausalReplay:
                       reason: str, exit_fee: float) -> None:
         meta = self.open_meta.pop(position.trade_id, {
             "entry_ts": position.opened_at, "entry_fee": position.entry_fee,
+            "entry_spread": 0.0, "entry_inning": 0,
         })
+        market = self.markets.get(position.market_key)
         self.trades.append(ReplayTrade(
-            strategy=position.strategy, market=position.market_key, team=position.team,
+            strategy=position.strategy, market=position.market_key,
+            game_pk=market.game_pk if market else None, token=position.token,
+            team=position.team,
             entry_ts=meta["entry_ts"], exit_ts=ts, entry_price=position.entry_price,
-            exit_price=fill, pnl_usd=pnl, fees_usd=meta["entry_fee"] + exit_fee,
+            exit_price=fill, qty=position.qty,
+            entry_spread=meta["entry_spread"], entry_inning=meta["entry_inning"],
+            pnl_usd=pnl, fees_usd=meta["entry_fee"] + exit_fee,
             exit_reason=reason,
         ))
         self.daily_pnl[(self._day_key(ts), position.strategy)] += pnl
@@ -379,6 +457,9 @@ class CausalReplay:
             self.peak[name] = max(self.peak[name], equity)
             self.max_drawdown[name] = max(self.max_drawdown[name], self.peak[name] - equity)
 
+    def _new_model_history(self) -> ModelHistory:
+        return ModelHistory(self.state_probability)
+
 
 def replay_recorded_day(cfg: Config, db_path: str, day: str | None = None) -> ReplayReport:
     start, end, label = day_bounds(day, cfg.engine.report_timezone)
@@ -395,6 +476,7 @@ def print_report(report: ReplayReport) -> None:
     print("=" * 88)
     print(f"events processed : {report.events}")
     print(f"run boundaries   : {report.run_boundaries}")
+    print(f"state model      : {report.state_model}")
     if report.skipped_strategies:
         print("skipped          : " + ", ".join(report.skipped_strategies) + " (non-deterministic shadow)")
     print()

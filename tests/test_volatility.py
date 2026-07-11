@@ -1,6 +1,26 @@
 from polybot.volatility import PriceHistory
 
 
+def test_time_grid_volatility_is_stable_across_polling_density():
+    sparse = PriceHistory()
+    dense = PriceHistory()
+    for ts, price in [(0, 0.50), (5, 0.55), (10, 0.50), (15, 0.60)]:
+        sparse.add(price, ts)
+    for ts in range(16):
+        anchors = {0: 0.50, 5: 0.55, 10: 0.50, 15: 0.60}
+        previous = max(k for k in anchors if k <= ts)
+        dense.add(anchors[previous], ts)
+    assert dense.realized_vol_time(15, 5) == sparse.realized_vol_time(15, 5)
+
+
+def test_flips_within_uses_trailing_time_not_lifetime_count():
+    history = PriceHistory(flip_band=0.03)
+    for ts, price in [(0, 0.40), (10, 0.60), (100, 0.40), (110, 0.60)]:
+        history.add(price, ts)
+    assert history.flips == 3
+    assert history.flips_within(20) == 2
+
+
 def fill(history, prices, start=0.0, step=1.0):
     for i, p in enumerate(prices):
         history.add(p, ts=start + i * step)
@@ -44,7 +64,7 @@ def test_realized_vol_flat_vs_choppy():
 def test_playful_by_flips_or_vol():
     h = PriceHistory(flip_band=0.03)
     fill(h, [0.60, 0.40, 0.60])
-    assert h.is_playful(min_flips=2, min_volatility=99.0)
+    assert h.flips >= 2  # playful by regime crossings alone
     quiet = PriceHistory()
     fill(quiet, [0.60, 0.61, 0.60, 0.61])
-    assert not quiet.is_playful(min_flips=2, min_volatility=0.05)
+    assert quiet.flips < 2 and quiet.realized_vol() < 0.05  # not playful

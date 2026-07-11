@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS decisions (
     flips INTEGER,
     realized_vol REAL,
     fair_home REAL,
+    anchor_price REAL,
+    anchor_model REAL,
+    model_delta REAL,
+    residual REAL,
+    anchor_age REAL,
     side TEXT,
     price REAL,
     fair REAL,
@@ -163,7 +168,12 @@ CREATE TABLE IF NOT EXISTS signals (
     inning INTEGER,
     is_top INTEGER,
     home_score INTEGER,
-    away_score INTEGER
+    away_score INTEGER,
+    anchor_price REAL,
+    anchor_model REAL,
+    model_delta REAL,
+    residual REAL,
+    anchor_age REAL
 );
 CREATE INDEX IF NOT EXISTS idx_signals_market_ts ON signals (market, ts);
 CREATE TABLE IF NOT EXISTS signal_counterfactuals (
@@ -193,6 +203,28 @@ CREATE TABLE IF NOT EXISTS strategy_registry (
     config_json TEXT,
     PRIMARY KEY (run_id, strategy)
 );
+CREATE TABLE IF NOT EXISTS model_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    run_id TEXT,
+    model TEXT NOT NULL,
+    market TEXT NOT NULL,
+    game_pk INTEGER NOT NULL,
+    state_signature TEXT NOT NULL,
+    model_home REAL NOT NULL,
+    pregame_anchor REAL,
+    anchored_fair REAL,
+    home_mid REAL,
+    spread REAL,
+    inning INTEGER,
+    is_top INTEGER,
+    outs INTEGER,
+    home_score INTEGER,
+    away_score INTEGER,
+    UNIQUE (run_id, model, market, state_signature)
+);
+CREATE INDEX IF NOT EXISTS idx_model_observations_market_ts
+    ON model_observations (market, ts);
 """
 
 _TRADE_V2_COLUMNS = {
@@ -212,14 +244,22 @@ _COLUMN_MIGRATIONS = {
     "equity": {"run_id": "TEXT"},
     "price_ticks": {"run_id": "TEXT", "received_at": "REAL", "source_ts": "REAL"},
     "game_states": {"run_id": "TEXT", "received_at": "REAL"},
-    "decisions": {"run_id": "TEXT"},
+    "decisions": {
+        "run_id": "TEXT", "anchor_price": "REAL", "anchor_model": "REAL",
+        "model_delta": "REAL", "residual": "REAL", "anchor_age": "REAL",
+    },
     "paper_positions": {"entry_fee": "REAL NOT NULL DEFAULT 0"},
-    "signals": {"net_edge": "REAL", "fee": "REAL", "outcome": "TEXT"},
+    "signals": {
+        "net_edge": "REAL", "fee": "REAL", "outcome": "TEXT",
+        "anchor_price": "REAL", "anchor_model": "REAL", "model_delta": "REAL",
+        "residual": "REAL", "anchor_age": "REAL",
+    },
 }
 
 _DECISION_COLUMNS = (
     "ts", "market", "strategy", "stage", "outcome", "mid", "move", "flips",
-    "realized_vol", "fair_home", "side", "price", "fair", "edge", "spread",
+    "realized_vol", "fair_home", "anchor_price", "anchor_model", "model_delta",
+    "residual", "anchor_age", "side", "price", "fair", "edge", "spread",
     "quote_age", "margin", "inning", "is_top", "home_score", "away_score", "run_id",
 )
 
@@ -354,15 +394,19 @@ class Journal:
     def record_signal(self, *, strategy, market, token, side_team, entry_price,
                       fair, edge, move, spread, inning, is_top, home_score,
                       away_score, net_edge=None, fee=None, outcome=None,
+                      anchor_price=None, anchor_model=None, model_delta=None,
+                      residual=None, anchor_age=None,
                       ts=None, commit=True) -> int:
         cur = self.conn.execute(
             """INSERT INTO signals (ts, run_id, strategy, market, token, side_team,
                entry_price, fair, edge, net_edge, fee, outcome, move, spread, inning,
-               is_top, home_score, away_score)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               is_top, home_score, away_score, anchor_price, anchor_model,
+               model_delta, residual, anchor_age)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (time.time() if ts is None else ts, self.active_run_id, strategy, market,
              token, side_team, entry_price, fair, edge, net_edge, fee, outcome, move,
-             spread, inning, is_top, home_score, away_score),
+             spread, inning, is_top, home_score, away_score, anchor_price,
+             anchor_model, model_delta, residual, anchor_age),
         )
         if commit:
             self.conn.commit()
@@ -379,6 +423,27 @@ class Journal:
                  e["config_hash"], e.get("config_json"))
                 for e in entries
             ],
+        )
+        if commit:
+            self.conn.commit()
+
+    def record_model_observation(self, *, model, market, game_state,
+                                 state_signature, model_home, pregame_anchor,
+                                 anchored_fair, home_mid, spread, ts=None,
+                                 commit=True) -> None:
+        self.conn.execute(
+            """INSERT OR IGNORE INTO model_observations
+               (ts, run_id, model, market, game_pk, state_signature, model_home,
+                pregame_anchor, anchored_fair, home_mid, spread, inning, is_top,
+                outs, home_score, away_score)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                time.time() if ts is None else ts, self.active_run_id, model, market,
+                game_state.game_pk, state_signature, model_home, pregame_anchor,
+                anchored_fair, home_mid, spread, game_state.inning,
+                int(game_state.is_top), game_state.outs, game_state.home_score,
+                game_state.away_score,
+            ),
         )
         if commit:
             self.conn.commit()
