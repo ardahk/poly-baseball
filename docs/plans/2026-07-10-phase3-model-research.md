@@ -14,8 +14,11 @@ Every candidate remains paper-only and competes on the Phase 2 causal simulator.
 - `fade_v1_frozen` and `fade_tight` remain the controls.
 - `liquidity_fade_v2` isolates unchanged-book shocks with fixed-time-grid
   volatility and trailing-window crossings, avoiding polling-rate artifacts.
-- `state_residual_v1` anchors to the last price known before a distinct received
-  MLB state and trades only inside a short response window.
+- `state_residual_v1` anchors to the last price observed at least
+  `residual_anchor_lookback_secs` before a distinct received MLB state (the
+  market prices a play before the polled feed reports it, so the immediate
+  pre-receipt price would double-count the event) and trades only inside a
+  short response window.
 - `market_anchor_v1` freezes the last pregame market midpoint and transfers the
   model's cumulative log-odds change onto that prior.
 - `ai_shadow` remains asynchronous and is excluded from deterministic replay.

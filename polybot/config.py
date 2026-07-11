@@ -55,6 +55,11 @@ class StrategyConfig:
     residual_threshold: float = 0.06
     residual_min_model_delta: float = 0.02
     residual_response_secs: float = 45.0
+    # The market reacts to a play seconds before the polled MLB feed reports
+    # it, so the very last pre-receipt price usually already prices the event.
+    # Anchor state transitions to the last price this many seconds before the
+    # state was received to avoid double-counting the move.
+    residual_anchor_lookback_secs: float = 30.0
     market_anchor_max_age_secs: float = 21600.0
 
 

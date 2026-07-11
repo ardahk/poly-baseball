@@ -278,11 +278,18 @@ class AnchoredStrategy(Strategy):
             ev.outcome = "price_band"
             ev.margin = price - self.config.min_price if price < self.config.min_price \
                 else self.config.max_price - price
-            return Decision(ev, ev.outcome, signal_candidate=True)
+            # The fade control does not treat price_band rejects as
+            # signal-grade candidates; keep episode accounting comparable.
+            return Decision(ev, ev.outcome)
         return self._gate_execution(ctx, ev, signal)
 
     def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
         view = self._view(ctx)
+        if view is not None and view.anchor_age > self._max_age():
+            # The entry gates reject a stale anchor; exits must not act on a
+            # fair the strategy itself considers invalid. Price-based stops,
+            # take profit, time stop, and settlement still apply.
+            view = None
         out: list[ExitIntent] = []
         for pos in positions:
             price = ctx.exit_price(pos.token)
@@ -412,7 +419,12 @@ def build_strategies(cfg) -> list[Strategy]:
         elif kind == "ai_shadow":
             if not cfg.ai.enabled:
                 continue
-            base = next(s for s in strats if s.name == entry["base"])
+            base = next((s for s in strats if s.name == entry["base"]), None)
+            if base is None:
+                raise ValueError(
+                    f"ai_shadow strategy {name!r} references base "
+                    f"{entry['base']!r}, which is not defined earlier in the registry"
+                )
             strats.append(AIShadowStrategy(name, entry.get("version", "v1"),
                                            base, cfg.ai))
         else:

@@ -37,6 +37,10 @@ strategy:
   residual_threshold: 0.06    # market must miss anchored fair by at least 6c
   residual_min_model_delta: 0.02 # ignore state updates with <2pt model impact
   residual_response_secs: 45  # short state-reaction window for residual strategy
+  residual_anchor_lookback_secs: 30 # anchor to the price this long BEFORE state
+                              # receipt: the market moves on a play seconds before
+                              # the MLB feed reports it, so the last pre-receipt
+                              # price usually already prices the event
   market_anchor_max_age_secs: 21600 # frozen pregame anchor valid through a game
 
 risk:

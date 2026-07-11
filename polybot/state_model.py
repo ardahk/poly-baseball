@@ -64,7 +64,7 @@ class EmpiricalStateModel:
     def predict(self, gs: GameState) -> float:
         analytic = home_win_probability(gs)
         cell = self.cells.get(empirical_state_key(gs))
-        if not cell:
+        if not cell or not cell["count"]:
             return analytic
         count = float(cell["count"])
         wins = float(cell["home_wins"])
@@ -101,11 +101,13 @@ class EmpiricalStateModel:
         }
 
     def save(self, path: str | Path) -> str:
-        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        body = self.to_dict()
+        payload = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                             allow_nan=False)
         digest = hashlib.sha256(payload.encode()).hexdigest()
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps({**self.to_dict(), "sha256": digest}, indent=2) + "\n")
+        target.write_text(json.dumps({**body, "sha256": digest}, indent=2) + "\n")
         return digest
 
     @classmethod
@@ -116,10 +118,14 @@ class EmpiricalStateModel:
         if data.get("model") != "empirical_state_v1" or not isinstance(data.get("cells"), dict):
             raise ValueError("invalid empirical state-model artifact")
         supplied = data.pop("sha256", None)
-        canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        canonical = json.dumps(data, sort_keys=True, separators=(",", ":"),
+                               allow_nan=False)
         actual = hashlib.sha256(canonical.encode()).hexdigest()
         if supplied != actual:
             raise ValueError("state-model artifact checksum mismatch")
+        prior_strength = float(data.get("prior_strength", 30.0))
+        if not prior_strength > 0:
+            raise ValueError("state-model artifact prior_strength must be positive")
         for key, cell in data["cells"].items():
             if not isinstance(key, str) or not isinstance(cell, dict) \
                     or not {"count", "home_wins"} <= set(cell):
@@ -142,8 +148,7 @@ class EmpiricalStateModel:
                 raise ValueError("state-model artifact has invalid holdout metrics") from None
             if regressed:
                 raise ValueError("state-model artifact failed its holdout acceptance gate")
-        return cls(data.get("cells") or {}, data.get("prior_strength", 30.0),
-                   metadata)
+        return cls(data.get("cells") or {}, prior_strength, metadata)
 
 
 def score_model(games: list[tuple[list[tuple[float, GameState]], bool]],
@@ -165,8 +170,7 @@ def score_model(games: list[tuple[list[tuple[float, GameState]], bool]],
     calibration = 0.0
     for bucket in range(10):
         selected = [(p, y) for p, y in rows
-                    if bucket / 10 <= p < (bucket + 1) / 10
-                    or (bucket == 9 and p == 1.0)]
+                    if bucket / 10 <= p < (bucket + 1) / 10]
         if selected:
             calibration += len(selected) / len(rows) * abs(
                 statistics.mean(p for p, _ in selected)

@@ -78,6 +78,56 @@ def test_reset_rolling_preserves_frozen_pregame_anchor():
     assert history.market_view(0.70, 6.0).anchor_price == 0.44
 
 
+def test_anchor_lookback_skips_prices_that_already_moved_on_the_event():
+    history = ModelHistory(probability, anchor_lookback_secs=30.0)
+    first = GameState(1, home_score=0, away_score=0, status="Live")
+    history.add_price(0.50, 0.0)
+    history.observe_state(first, 1.0)
+    history.add_price(0.50, 60.0)   # calm pre-event price
+    history.add_price(0.62, 85.0)   # market reacts to the play at ~t=85
+    history.add_price(0.63, 89.0)
+    # The feed reports the score change at t=90; the last pre-receipt prices
+    # already contain the move and must NOT become the anchor.
+    changed = GameState(1, home_score=1, away_score=0, status="Live")
+    history.observe_state(changed, 90.0)
+    view = history.state_view(0.63, 91.0)
+    assert view.anchor_price == 0.50   # price from t=60 (>=30s before receipt)
+    assert view.anchor_model == 0.50
+    # Fair reflects the model delta applied to the PRE-event price, so a
+    # market that correctly priced the run shows little residual in logit
+    # terms rather than a phantom double-counted edge.
+    assert view.fair_home == pytest.approx(0.70, abs=0.02)
+
+
+def test_anchor_lookback_warmup_falls_back_to_last_pre_receipt_price():
+    history = ModelHistory(probability, anchor_lookback_secs=30.0)
+    first = GameState(1, home_score=0, away_score=0, status="Live")
+    history.observe_state(first, 1.0)
+    history.add_price(0.55, 2.0)  # only price ever seen, 3s before the change
+    changed = GameState(1, home_score=1, away_score=0, status="Live")
+    history.observe_state(changed, 5.0)
+    view = history.state_view(0.55, 6.0)
+    assert view is not None and view.anchor_price == 0.55
+
+
+def test_anchor_model_matches_state_in_effect_at_anchor_price_time():
+    history = ModelHistory(
+        lambda gs: {0: 0.50, 1: 0.70, 2: 0.85}[gs.home_score],
+        anchor_lookback_secs=30.0,
+    )
+    history.add_price(0.50, 0.0)
+    history.observe_state(GameState(1, status="Live"), 1.0)
+    history.add_price(0.52, 10.0)
+    history.observe_state(GameState(1, home_score=1, status="Live"), 20.0)
+    history.add_price(0.70, 30.0)
+    # Second run scores; anchor cutoff is t=20, so the anchor price is the
+    # t=10 print, when the 0-0 model (0.50) was still in effect.
+    history.observe_state(GameState(1, home_score=2, status="Live"), 50.0)
+    view = history.state_view(0.70, 51.0)
+    assert view.anchor_price == 0.52
+    assert view.anchor_model == 0.50
+
+
 def test_log_odds_transfer_is_symmetric_and_finite_near_boundaries():
     home = transfer_model_delta(0.40, 0.50, 0.70)
     away = transfer_model_delta(0.60, 0.50, 0.30)

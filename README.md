@@ -145,10 +145,13 @@ Two ways to validate the math on **real finished games** before risking money:
 ## Phase 3 model research
 
 The state-residual and market-anchored families use causal model deltas. The
-state-residual anchor is the last price known before a changed MLB state was
-received. The market anchor is the last valid pregame price and is frozen when
-the first live state arrives. A quote observed with or after a state update can
-never become that update's prior anchor.
+state-residual anchor is the last price at least
+`residual_anchor_lookback_secs` before a changed MLB state was received — the
+market reacts to a play seconds before the polled feed reports it, so the very
+last pre-receipt price usually already contains the event's move and would
+double-count it. The market anchor is the last valid pregame price and is
+frozen when the first live state arrives. A quote observed with or after a
+state update can never become that update's prior anchor.
 
 `research fit-state` builds a beta-smoothed empirical state table from declared
 training seasons and scores it against both outcomes and the analytic control

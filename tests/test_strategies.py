@@ -242,6 +242,39 @@ def test_market_anchor_requires_a_recorded_pregame_price():
     assert decision.intent is None
 
 
+def test_anchored_manage_ignores_stale_anchor_fair():
+    cfg = StrategyConfig(residual_response_secs=45, edge_exit=0.03,
+                         take_profit=99.0, stop_loss=0.99, max_hold_secs=9999)
+    strat = StateResidualStrategy("residual", "v1", cfg)
+    model = ModelHistory(lambda gs: 0.70 if gs.home_score > gs.away_score else 0.50)
+    model.observe_state(GameState(1, status="Live"), 2.0)
+    model.add_price(0.50, 3.0)
+    gs = GameState(1, home_score=1, status="Live")
+    model.observe_state(gs, 4.0)  # transition anchor at 3.0
+    history = PriceHistory()
+    history.add(0.60, 120.0)
+    ctx = StratContext(
+        market(), history, gs,
+        MarketQuote("m1", 0.59, 0.61, 0.59, 0.61, ts=120.0),
+        now=120.0, model_history=model,
+    )
+    pos = Position(strategy="residual", market_key="m1", token="m1:SHORT",
+                   team="Away", qty=10.0, entry_price=0.40, opened_at=100.0)
+    # The stale anchored fair (home 0.70 -> away 0.30 vs bid 0.39) would fire
+    # "edge gone", but the anchor is 116s old — far past residual_response_secs
+    # — so exits must not act on a fair the entry gates consider invalid.
+    assert strat.manage(ctx, [pos]) == []
+
+
+def test_anchored_price_band_reject_is_not_a_signal_candidate():
+    cfg = StrategyConfig(min_edge=0.02, residual_threshold=0.04,
+                         residual_min_model_delta=0.01, max_price=0.55)
+    strat = StateResidualStrategy("residual", "v1", cfg)
+    decision = strat.evaluate(_anchored_context(0.60))
+    assert decision.outcome == "price_band"
+    assert decision.signal_candidate is False  # matches the fade control
+
+
 def test_registry_builds_phase3_strategy_kinds():
     cfg = Config()
     cfg.ai.enabled = False

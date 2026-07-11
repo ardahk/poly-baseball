@@ -15,6 +15,10 @@ _KNOBS = {
     "stale_quote": "strategy.max_quote_age_secs",
     "price_band": "strategy.min_price/max_price",
     "early_game": "strategy.early_game_min_edge/fair_extreme",
+    "small_residual": "strategy.residual_threshold",
+    "small_model_move": "strategy.residual_min_model_delta",
+    "anchor_stale": "strategy.residual_response_secs/market_anchor_max_age_secs",
+    "execution_cost": "strategy.min_edge (net of fees + spread)",
 }
 
 

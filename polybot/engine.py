@@ -248,7 +248,8 @@ class Engine:
                                 }
                                 view = None if model_history.last_price is None else \
                                     model_history.market_view(
-                                        model_history.last_price, gs.received_at, beta=1.0,
+                                        model_history.last_price, gs.received_at,
+                                        beta=self.cfg.strategy.residual_beta,
                                     )
                                 quote = self.latest_quotes.get(linked.key)
                                 self.journal.record_model_observation(
@@ -678,7 +679,10 @@ class Engine:
         return rcfg.stake_usd
 
     def _new_model_history(self) -> ModelHistory:
-        return ModelHistory(self.state_probability)
+        return ModelHistory(
+            self.state_probability,
+            anchor_lookback_secs=self.cfg.strategy.residual_anchor_lookback_secs,
+        )
 
     # ---------------------------------------------------------------- equity
 

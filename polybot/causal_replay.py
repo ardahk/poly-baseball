@@ -458,7 +458,10 @@ class CausalReplay:
             self.max_drawdown[name] = max(self.max_drawdown[name], self.peak[name] - equity)
 
     def _new_model_history(self) -> ModelHistory:
-        return ModelHistory(self.state_probability)
+        return ModelHistory(
+            self.state_probability,
+            anchor_lookback_secs=self.cfg.strategy.residual_anchor_lookback_secs,
+        )
 
 
 def replay_recorded_day(cfg: Config, db_path: str, day: str | None = None) -> ReplayReport:
