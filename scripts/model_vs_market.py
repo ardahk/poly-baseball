@@ -24,6 +24,15 @@ from polybot.winprob import home_win_probability
 
 DB = sys.argv[1] if len(sys.argv) > 1 else "/tmp/pb_check.db"
 MIN_EDGE = float(sys.argv[2]) if len(sys.argv) > 2 else 0.05
+ARTIFACT = sys.argv[3] if len(sys.argv) > 3 else None
+
+if ARTIFACT:
+    from polybot.state_model import EmpiricalStateModel
+    predict = EmpiricalStateModel.load(ARTIFACT, require_accepted=False).predict
+    MODEL_LABEL = f"empirical:{os.path.basename(ARTIFACT)}"
+else:
+    predict = home_win_probability
+    MODEL_LABEL = "analytic"
 
 
 def brier(p: float, y: int) -> float:
@@ -80,7 +89,7 @@ def main() -> None:
         gs = states[pk][idx][1]
         y = home_won[pk]
         mkt = r["home_mid"]
-        mdl = home_win_probability(gs)
+        mdl = predict(gs)
 
         n += 1
         bm += brier(mkt, y)
@@ -110,7 +119,7 @@ def main() -> None:
     print(f"db={DB}  scored ticks={n:,}  min_edge={MIN_EDGE}")
     print(f"{'':16}{'Brier':>10}   (lower is better)")
     print(f"{'market':16}{bm/n:>10.4f}")
-    print(f"{'model':16}{bmod/n:>10.4f}")
+    print(f"{MODEL_LABEL:16}{bmod/n:>10.4f}")
     verdict = "MODEL beats market" if bmod < bm else "MARKET beats model"
     print(f"  --> {verdict} by {abs(bm-bmod)/n:.4f} Brier\n")
 
