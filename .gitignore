@@ -1,6 +1,40 @@
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Python
 .venv/
 __pycache__/
-*.pyc
-polybot.db
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local databases (paper/live journal)
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Generated research outputs
+artifacts/
+
+# Local scratch / ad-hoc analysis
+scratchpad/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local AI session config
+.claude/
