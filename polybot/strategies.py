@@ -8,6 +8,7 @@ signal quality cleanly separable from execution quality.
 from __future__ import annotations
 
 import dataclasses
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -126,6 +127,70 @@ class Strategy:
         """Discard strategy-local transient state after a run/data boundary."""
         pass
 
+    def _manage_positions(self, ctx: StratContext, positions: list[Position],
+                          fair_home: float | None) -> list[ExitIntent]:
+        """Shared exit management: TP/SL/time/edge/settlement via check_exit.
+
+        `fair_home` None disables the edge-gone exit; price-based stops, the
+        time stop, and settlement on game final always apply.
+        """
+        out: list[ExitIntent] = []
+        for pos in positions:
+            price = ctx.exit_price(pos.token)
+            fair = None
+            if fair_home is not None:
+                fair = fair_home if pos.token == ctx.market.home_token \
+                    else 1.0 - fair_home
+            reason = _fade.check_exit(
+                pos, price, fair,
+                bool(ctx.game_state and ctx.game_state.is_final), self.config,
+                now=ctx.now, fee_theta=ctx.fee_theta,
+            )
+            if reason:
+                out.append(ExitIntent(pos, price, reason, fair))
+        return out
+
+    def _tick_detail(self, ctx: StratContext) -> tuple[dict, Decision | None]:
+        """Common evaluate() prelude: base features + not_live/no_price gates."""
+        history = ctx.history
+        base = {
+            "mid": history.last,
+            "flips": history.flips,
+            "realized_vol": history.realized_vol(self.config.vol_window),
+        }
+        if ctx.game_state is None or not ctx.game_state.is_live:
+            return base, Decision(EntryEvaluation(outcome="not_live", **base), "not_live")
+        if history.last is None:
+            return base, Decision(EntryEvaluation(outcome="no_price", **base), "no_price")
+        return base, None
+
+    def _side_candidate(self, ctx: StratContext, detail: dict, buy_home: bool,
+                        fair_home: float, move: float, reason: str) -> Decision:
+        """Build a one-side Signal, apply the config price band, gate execution."""
+        market = ctx.market
+        mid = ctx.history.last
+        if buy_home:
+            token, team, price, fair = (
+                market.home_token, market.home_team, mid, fair_home,
+            )
+        else:
+            token, team, price, fair = (
+                market.away_token, market.away_team, 1.0 - mid, 1.0 - fair_home,
+            )
+        edge = fair - price
+        signal = Signal(market=market, token=token, side_team=team, price=price,
+                        fair=fair, move=move, reason=reason)
+        ev = EntryEvaluation(
+            outcome="signal", side_team=team, price=price, fair=fair, edge=edge,
+            margin=edge - self.config.min_edge, signal=signal, **detail,
+        )
+        if not (self.config.min_price <= price <= self.config.max_price):
+            ev.outcome = "price_band"
+            ev.margin = price - self.config.min_price if price < self.config.min_price \
+                else self.config.max_price - price
+            return Decision(ev, ev.outcome)
+        return self._gate_execution(ctx, ev, signal)
+
     def _gate_execution(self, ctx: StratContext, ev: EntryEvaluation,
                         sig: Signal) -> Decision:
         """Shared executability cascade: a signal-grade candidate becomes an
@@ -164,19 +229,8 @@ class FadeStrategy(Strategy):
 
     def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
         gs = ctx.game_state
-        out: list[ExitIntent] = []
-        for pos in positions:
-            price = ctx.exit_price(pos.token)
-            fair = None
-            if gs:
-                fair_home = _fade.fair_home_value(gs, self.config)
-                fair = fair_home if pos.token == ctx.market.home_token else 1.0 - fair_home
-            reason = _fade.check_exit(pos, price, fair,
-                                      bool(gs and gs.is_final), self.config,
-                                      now=ctx.now, fee_theta=ctx.fee_theta)
-            if reason:
-                out.append(ExitIntent(position=pos, price=price, reason=reason, fair=fair))
-        return out
+        fair_home = _fade.fair_home_value(gs, self.config) if gs else None
+        return self._manage_positions(ctx, positions, fair_home)
 
 
 class AnchoredStrategy(Strategy):
@@ -290,21 +344,9 @@ class AnchoredStrategy(Strategy):
             # fair the strategy itself considers invalid. Price-based stops,
             # take profit, time stop, and settlement still apply.
             view = None
-        out: list[ExitIntent] = []
-        for pos in positions:
-            price = ctx.exit_price(pos.token)
-            fair = None
-            if view is not None:
-                fair = view.fair_home if pos.token == ctx.market.home_token \
-                    else 1.0 - view.fair_home
-            reason = _fade.check_exit(
-                pos, price, fair,
-                bool(ctx.game_state and ctx.game_state.is_final), self.config,
-                now=ctx.now, fee_theta=ctx.fee_theta,
-            )
-            if reason:
-                out.append(ExitIntent(pos, price, reason, fair))
-        return out
+        return self._manage_positions(
+            ctx, positions, view.fair_home if view is not None else None,
+        )
 
 
 class StateResidualStrategy(AnchoredStrategy):
@@ -389,6 +431,417 @@ class AIShadowStrategy(Strategy):
         self._pool.shutdown(wait=False, cancel_futures=True)
 
 
+class MomentumStrategy(Strategy):
+    """Trade WITH a sharp move: in-game moves are information (the refuted-fade
+    result inverted), so a large recent move should on average continue or at
+    least not revert within the holding window."""
+
+    kind = "momentum"
+
+    def evaluate(self, ctx: StratContext) -> Decision:
+        detail, early = self._tick_detail(ctx)
+        if early:
+            return early
+        cfg = self.config
+        move = ctx.history.move(cfg.move_lookback_secs)
+        detail["move"] = move
+        if move is None or abs(move) < cfg.move_threshold:
+            margin = None if move is None else abs(move) - cfg.move_threshold
+            ev = EntryEvaluation(outcome="small_move", margin=margin, **detail)
+            return Decision(ev, ev.outcome)
+        if cfg.momentum_min_state_age_secs > 0:
+            view = None
+            if ctx.model_history is not None and ctx.history.last is not None:
+                view = ctx.model_history.state_view(ctx.history.last, ctx.now)
+            if view is not None and view.anchor_age < cfg.momentum_min_state_age_secs:
+                ev = EntryEvaluation(
+                    outcome="state_too_fresh",
+                    margin=view.anchor_age - cfg.momentum_min_state_age_secs,
+                    anchor_age=view.anchor_age, **detail,
+                )
+                return Decision(ev, ev.outcome)
+        fair_home = _fade.fair_home_value(ctx.game_state, cfg)
+        detail["fair_home"] = fair_home
+        buy_home = move > 0
+        if cfg.momentum_require_model_agree:
+            side_fair = fair_home if buy_home else 1.0 - fair_home
+            side_price = ctx.history.last if buy_home else 1.0 - ctx.history.last
+            if side_fair < side_price:
+                ev = EntryEvaluation(outcome="model_disagrees",
+                                     margin=side_fair - side_price, **detail)
+                return Decision(ev, ev.outcome)
+        reason = (f"momentum move {move:+.3f}/{cfg.move_lookback_secs:.0f}s; "
+                  f"buying the moving side")
+        return self._side_candidate(ctx, detail, buy_home, fair_home, move, reason)
+
+    def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
+        # Momentum exits on price (TP/SL/time/settlement), never on model fair:
+        # the mechanism claims the MARKET move is the information.
+        return self._manage_positions(ctx, positions, None)
+
+
+class EventReactionStrategy(Strategy):
+    """Buy in the model-delta direction while the market still lags a freshly
+    received state change (with-the-news underreaction; the sign-opposite of
+    the state_residual fade, isolated from its overreaction half)."""
+
+    kind = "event_reaction"
+
+    def __init__(self, name: str, version: str, config: StrategyConfig):
+        super().__init__(name, version, config)
+        self._last_state: dict[str, GameState] = {}
+        self._events: dict[str, tuple[str, float]] = {}   # market -> (class, received_at)
+
+    def reset_market(self, market_key: str) -> None:
+        self._last_state.pop(market_key, None)
+        self._events.pop(market_key, None)
+
+    @staticmethod
+    def _classify(prev: GameState, cur: GameState) -> str | None:
+        if cur.home_score != prev.home_score or cur.away_score != prev.away_score:
+            return "score_change"
+        if cur.inning != prev.inning or cur.is_top != prev.is_top:
+            return "inning_change"
+        if (cur.outs != prev.outs or cur.on_first != prev.on_first
+                or cur.on_second != prev.on_second or cur.on_third != prev.on_third):
+            return "bases_or_outs"
+        return None
+
+    def _track_event(self, ctx: StratContext) -> None:
+        gs = ctx.game_state
+        key = ctx.market.key
+        prev = self._last_state.get(key)
+        if prev is not None and gs.received_at != prev.received_at:
+            event_class = self._classify(prev, gs)
+            if event_class is not None:
+                self._events[key] = (event_class, gs.received_at)
+        self._last_state[key] = gs
+
+    def evaluate(self, ctx: StratContext) -> Decision:
+        detail, early = self._tick_detail(ctx)
+        if early:
+            return early
+        cfg = self.config
+        self._track_event(ctx)
+        gs = ctx.game_state
+        if gs.inning < cfg.event_min_inning:
+            ev = EntryEvaluation(outcome="early_game",
+                                 margin=gs.inning - cfg.event_min_inning, **detail)
+            return Decision(ev, ev.outcome)
+        event = self._events.get(ctx.market.key)
+        if event is None or ctx.now - event[1] > cfg.event_max_age_secs:
+            ev = EntryEvaluation(outcome="no_event", **detail)
+            return Decision(ev, ev.outcome)
+        if cfg.event_class != "any" and event[0] != cfg.event_class:
+            ev = EntryEvaluation(outcome="wrong_event_class", **detail)
+            return Decision(ev, ev.outcome)
+        view = None
+        if ctx.model_history is not None:
+            view = ctx.model_history.state_view(ctx.history.last, ctx.now)
+        if view is None:
+            ev = EntryEvaluation(outcome="state_warmup", **detail)
+            return Decision(ev, ev.outcome)
+        detail.update(fair_home=view.fair_home, anchor_price=view.anchor_price,
+                      anchor_model=view.anchor_model, model_delta=view.model_delta,
+                      residual=view.residual, anchor_age=view.anchor_age,
+                      move=view.market_delta)
+        if abs(view.model_delta) < cfg.event_min_model_delta:
+            ev = EntryEvaluation(
+                outcome="small_model_move",
+                margin=abs(view.model_delta) - cfg.event_min_model_delta, **detail,
+            )
+            return Decision(ev, ev.outcome)
+        # Underreaction only: the market must trail the anchored fair in the
+        # model-delta direction. (residual = market - anchored fair, so lagging
+        # a positive delta means residual < 0 and vice versa.)
+        if view.model_delta > 0 and view.residual <= -cfg.event_min_underreaction:
+            buy_home = True
+        elif view.model_delta < 0 and view.residual >= cfg.event_min_underreaction:
+            buy_home = False
+        else:
+            ev = EntryEvaluation(
+                outcome="no_underreaction",
+                margin=abs(view.residual) - cfg.event_min_underreaction, **detail,
+            )
+            return Decision(ev, ev.outcome)
+        reason = (f"event_reaction {event[0]} model delta {view.model_delta:+.3f}; "
+                  f"market lags anchored fair by {view.residual:+.3f}")
+        return self._side_candidate(ctx, detail, buy_home, view.fair_home,
+                                    view.market_delta, reason)
+
+    def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
+        # Price-based exits only; the entry edge lives for seconds, so an
+        # anchored-fair edge exit would churn every position immediately.
+        return self._manage_positions(ctx, positions, None)
+
+
+class ExtremeHoldStrategy(Strategy):
+    """Buy the side priced inside an extreme band and hold to settlement: the
+    taker fee is theta*p*(1-p), so the cost floor collapses at the tails while
+    any systematic favorite/longshot mispricing persists to the end."""
+
+    kind = "extreme_hold"
+
+    def evaluate(self, ctx: StratContext) -> Decision:
+        detail, early = self._tick_detail(ctx)
+        if early:
+            return early
+        cfg = self.config
+        gs = ctx.game_state
+        if not (cfg.extreme_min_inning <= gs.inning <= cfg.extreme_max_inning):
+            ev = EntryEvaluation(outcome="outside_inning_band", **detail)
+            return Decision(ev, ev.outcome)
+        mid = ctx.history.last
+        candidates = [(mid, True), (1.0 - mid, False)]
+        in_band = [(p, home) for p, home in candidates
+                   if cfg.extreme_min_price <= p <= cfg.extreme_max_price]
+        if not in_band:
+            nearest = min(abs(p - cfg.extreme_min_price) for p, _ in candidates)
+            ev = EntryEvaluation(outcome="outside_price_band", margin=-nearest, **detail)
+            return Decision(ev, ev.outcome)
+        price, buy_home = max(in_band)
+        fair_home = _fade.fair_home_value(gs, cfg)
+        detail["fair_home"] = fair_home
+        if cfg.extreme_require_model_agree:
+            side_fair = fair_home if buy_home else 1.0 - fair_home
+            required = price + cfg.extreme_model_agree_margin
+            if side_fair < required:
+                ev = EntryEvaluation(outcome="model_disagrees",
+                                     margin=side_fair - required, **detail)
+                return Decision(ev, ev.outcome)
+        reason = (f"extreme_hold {price:.3f} in "
+                  f"[{cfg.extreme_min_price:.2f}, {cfg.extreme_max_price:.2f}], "
+                  f"inning {gs.inning}; hold to settlement")
+        move = ctx.history.move(cfg.move_lookback_secs) or 0.0
+        return self._side_candidate(ctx, detail, buy_home, fair_home, move, reason)
+
+    def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
+        return self._manage_positions(ctx, positions, None)
+
+
+class SettlementHoldStrategy(Strategy):
+    """Model-vs-market disagreement held to settlement: one fee leg instead of
+    two, so the cost floor is ~half the round-trip fade's. Makes the locked
+    2026-07-12 preregistered rule a live frozen strategy."""
+
+    kind = "settlement_hold"
+
+    def evaluate(self, ctx: StratContext) -> Decision:
+        detail, early = self._tick_detail(ctx)
+        if early:
+            return early
+        cfg = self.config
+        gs = ctx.game_state
+        if gs.inning > cfg.hold_max_inning:
+            ev = EntryEvaluation(outcome="late_inning",
+                                 margin=cfg.hold_max_inning - gs.inning, **detail)
+            return Decision(ev, ev.outcome)
+        if cfg.hold_fair_source == "market_anchored":
+            view = None
+            if ctx.model_history is not None:
+                view = ctx.model_history.market_view(ctx.history.last, ctx.now)
+            if view is None:
+                ev = EntryEvaluation(outcome="no_pregame_anchor", **detail)
+                return Decision(ev, ev.outcome)
+            fair_home = view.fair_home
+            detail.update(anchor_price=view.anchor_price, anchor_model=view.anchor_model,
+                          model_delta=view.model_delta, anchor_age=view.anchor_age)
+        else:
+            fair_home = _fade.fair_home_value(gs, cfg)
+        detail["fair_home"] = fair_home
+        gap = fair_home - ctx.history.last
+        if gap >= cfg.hold_min_edge:
+            buy_home = True
+        elif -gap >= cfg.hold_min_edge:
+            buy_home = False
+        else:
+            ev = EntryEvaluation(outcome="small_gap",
+                                 margin=abs(gap) - cfg.hold_min_edge, **detail)
+            return Decision(ev, ev.outcome)
+        if cfg.hold_side_filter != "any" and \
+                (cfg.hold_side_filter == "home") != buy_home:
+            ev = EntryEvaluation(outcome="side_filtered", **detail)
+            return Decision(ev, ev.outcome)
+        reason = (f"settlement_hold {cfg.hold_fair_source} gap {gap:+.3f} "
+                  f"(fair {fair_home:.3f}), inning {gs.inning}; hold to settlement")
+        return self._side_candidate(ctx, detail, buy_home, fair_home, 0.0, reason)
+
+    def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
+        return self._manage_positions(ctx, positions, None)
+
+
+class CalibrationCellStrategy(Strategy):
+    """Model-free bias harvesting: buy a specific side whenever the market
+    enters a (price band x inning band x side) cell and hold to settlement.
+    The hypothesis is systematic miscalibration of the cell itself
+    (favorite-longshot bias, home bias, slow crediting of leads)."""
+
+    kind = "calibration_cell"
+
+    def _cell_side(self, ctx: StratContext) -> bool | None:
+        """Which side the cell buys: True=home, False=away, None=undefined."""
+        side = self.config.cell_side
+        gs = ctx.game_state
+        mid = ctx.history.last
+        if side == "home":
+            return True
+        if side == "away":
+            return False
+        if side == "favorite":
+            return mid >= 0.5
+        if side == "underdog":
+            return mid < 0.5
+        if side in ("leader", "trailer"):
+            if gs.home_score == gs.away_score:
+                return None
+            leading_home = gs.home_score > gs.away_score
+            return leading_home if side == "leader" else not leading_home
+        raise ValueError(f"unknown cell_side {side!r}")
+
+    def evaluate(self, ctx: StratContext) -> Decision:
+        detail, early = self._tick_detail(ctx)
+        if early:
+            return early
+        cfg = self.config
+        gs = ctx.game_state
+        if not (cfg.cell_inning_min <= gs.inning <= cfg.cell_inning_max):
+            ev = EntryEvaluation(outcome="outside_cell_inning", **detail)
+            return Decision(ev, ev.outcome)
+        buy_home = self._cell_side(ctx)
+        if buy_home is None:
+            ev = EntryEvaluation(outcome="no_cell_side", **detail)
+            return Decision(ev, ev.outcome)
+        price = ctx.history.last if buy_home else 1.0 - ctx.history.last
+        if not (cfg.cell_price_min <= price <= cfg.cell_price_max):
+            margin = price - cfg.cell_price_min if price < cfg.cell_price_min \
+                else cfg.cell_price_max - price
+            ev = EntryEvaluation(outcome="outside_cell_price", margin=margin, **detail)
+            return Decision(ev, ev.outcome)
+        fair_home = _fade.fair_home_value(gs, cfg)
+        detail["fair_home"] = fair_home
+        reason = (f"calibration_cell {cfg.cell_side} @ {price:.3f} in "
+                  f"[{cfg.cell_price_min:.2f}, {cfg.cell_price_max:.2f}], "
+                  f"inning {gs.inning}; hold to settlement")
+        return self._side_candidate(ctx, detail, buy_home, fair_home, 0.0, reason)
+
+    def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
+        return self._manage_positions(ctx, positions, None)
+
+
+class MicrostructureStrategy(Strategy):
+    """Book-shape/timing mechanisms selected by `micro_mode`:
+
+    - spread_snap: a spread shock that re-tightens reveals which side's quotes
+      improved; the reprice direction carries information.
+    - stale_reprice: after a one-sided/absent-book gap, the reprice vs the
+      pre-gap mid reflects information accumulated during the outage.
+    - pregame_drift: late pregame money is informed (lineups, pitchers); ride
+      the last-30-minute pregame move at the first live tick.
+    """
+
+    kind = "microstructure"
+
+    def __init__(self, name: str, version: str, config: StrategyConfig):
+        super().__init__(name, version, config)
+        self._quotes: dict[str, deque] = {}       # market -> (ts, mid, spread)
+        self._fired: set[str] = set()             # pregame_drift once per game
+
+    def reset_market(self, market_key: str) -> None:
+        self._quotes.pop(market_key, None)
+        self._fired.discard(market_key)
+
+    def _reject(self, detail: dict, outcome: str, margin: float | None = None) -> Decision:
+        ev = EntryEvaluation(outcome=outcome, margin=margin, **detail)
+        return Decision(ev, ev.outcome)
+
+    def evaluate(self, ctx: StratContext) -> Decision:
+        detail, early = self._tick_detail(ctx)
+        if early:
+            return early
+        cfg = self.config
+        buf = self._quotes.setdefault(ctx.market.key, deque())
+        prev_quote = buf[-1] if buf else None
+        if ctx.quote is not None:
+            buf.append((ctx.quote.ts, ctx.quote.home_mid, ctx.quote.home_spread))
+            horizon = max(cfg.micro_window_secs * 3, 300.0)
+            while buf and buf[0][0] < ctx.now - horizon:
+                buf.popleft()
+
+        if cfg.micro_mode == "pregame_drift":
+            return self._pregame_drift(ctx, detail)
+        if ctx.quote is None:
+            return self._reject(detail, "no_quote_yet")
+        if cfg.micro_mode == "spread_snap":
+            return self._spread_snap(ctx, detail, buf)
+        if cfg.micro_mode == "stale_reprice":
+            return self._stale_reprice(ctx, detail, prev_quote)
+        raise ValueError(f"unknown micro_mode {cfg.micro_mode!r}")
+
+    def _finish(self, ctx: StratContext, detail: dict, buy_home: bool,
+                move: float, reason: str) -> Decision:
+        fair_home = _fade.fair_home_value(ctx.game_state, self.config)
+        detail["fair_home"] = fair_home
+        return self._side_candidate(ctx, detail, buy_home, fair_home, move, reason)
+
+    def _spread_snap(self, ctx: StratContext, detail: dict, buf: deque) -> Decision:
+        cfg = self.config
+        window = [q for q in buf if q[0] >= ctx.now - cfg.micro_window_secs]
+        if len(window) < 2:
+            return self._reject(detail, "no_spread_shock")
+        peak_ts, peak_mid, peak_spread = max(window[:-1], key=lambda q: q[2])
+        cur_spread = ctx.quote.home_spread
+        if peak_spread < cfg.micro_spread_shock or cur_spread >= cfg.micro_spread_shock:
+            return self._reject(detail, "no_spread_shock",
+                                margin=peak_spread - cfg.micro_spread_shock)
+        reprice = ctx.quote.home_mid - peak_mid
+        detail["move"] = reprice
+        if abs(reprice) < cfg.micro_min_reprice:
+            return self._reject(detail, "small_reprice",
+                                margin=abs(reprice) - cfg.micro_min_reprice)
+        reason = (f"spread_snap shock {peak_spread:.3f} -> {cur_spread:.3f}; "
+                  f"reprice {reprice:+.3f}")
+        return self._finish(ctx, detail, reprice > 0, reprice, reason)
+
+    def _stale_reprice(self, ctx: StratContext, detail: dict,
+                       prev_quote: tuple | None) -> Decision:
+        cfg = self.config
+        if prev_quote is None:
+            return self._reject(detail, "no_gap")
+        gap = ctx.quote.ts - prev_quote[0]
+        if gap < cfg.micro_window_secs:
+            return self._reject(detail, "no_gap", margin=gap - cfg.micro_window_secs)
+        reprice = ctx.quote.home_mid - prev_quote[1]
+        detail["move"] = reprice
+        if abs(reprice) < cfg.micro_min_reprice:
+            return self._reject(detail, "small_reprice",
+                                margin=abs(reprice) - cfg.micro_min_reprice)
+        reason = f"stale_reprice after {gap:.0f}s book gap; reprice {reprice:+.3f}"
+        return self._finish(ctx, detail, reprice > 0, reprice, reason)
+
+    def _pregame_drift(self, ctx: StratContext, detail: dict) -> Decision:
+        cfg = self.config
+        key = ctx.market.key
+        if key in self._fired:
+            return self._reject(detail, "already_fired")
+        if ctx.game_state.inning > 1:
+            self._fired.add(key)     # missed the window for this game
+            return self._reject(detail, "too_late")
+        past = ctx.history.price_ago(1800.0)
+        if past is None:
+            return self._reject(detail, "no_pregame_history")
+        drift = ctx.history.last - past
+        detail["move"] = drift
+        if abs(drift) < cfg.micro_min_reprice:
+            return self._reject(detail, "small_reprice",
+                                margin=abs(drift) - cfg.micro_min_reprice)
+        self._fired.add(key)
+        reason = f"pregame_drift {drift:+.3f} over the last 30 pregame minutes"
+        return self._finish(ctx, detail, drift > 0, drift, reason)
+
+    def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:
+        return self._manage_positions(ctx, positions, None)
+
+
 DEFAULT_REGISTRY = [
     {"name": "fade_v1_frozen", "kind": "fade"},
     {"name": "fade_tight", "kind": "fade",
@@ -401,6 +854,19 @@ DEFAULT_REGISTRY = [
 ]
 
 
+STRATEGY_KINDS: dict[str, type[Strategy]] = {
+    "fade": FadeStrategy,
+    "state_residual": StateResidualStrategy,
+    "market_anchored": MarketAnchoredStrategy,
+    "momentum": MomentumStrategy,
+    "event_reaction": EventReactionStrategy,
+    "extreme_hold": ExtremeHoldStrategy,
+    "settlement_hold": SettlementHoldStrategy,
+    "calibration_cell": CalibrationCellStrategy,
+    "microstructure": MicrostructureStrategy,
+}
+
+
 def build_strategies(cfg) -> list[Strategy]:
     """Instantiate the strategy registry from config (or the built-in default)."""
     entries = cfg.strategies or DEFAULT_REGISTRY
@@ -408,15 +874,7 @@ def build_strategies(cfg) -> list[Strategy]:
     for entry in entries:
         kind = entry.get("kind", "fade")
         name = entry["name"]
-        if kind == "fade":
-            sconf = dataclasses.replace(cfg.strategy, **entry.get("overrides", {}))
-            strats.append(FadeStrategy(name, entry.get("version", "v1"), sconf))
-        elif kind in {"state_residual", "market_anchored"}:
-            sconf = dataclasses.replace(cfg.strategy, **entry.get("overrides", {}))
-            cls = StateResidualStrategy if kind == "state_residual" \
-                else MarketAnchoredStrategy
-            strats.append(cls(name, entry.get("version", "v1"), sconf))
-        elif kind == "ai_shadow":
+        if kind == "ai_shadow":
             if not cfg.ai.enabled:
                 continue
             base = next((s for s in strats if s.name == entry["base"]), None)
@@ -427,6 +885,10 @@ def build_strategies(cfg) -> list[Strategy]:
                 )
             strats.append(AIShadowStrategy(name, entry.get("version", "v1"),
                                            base, cfg.ai))
-        else:
+            continue
+        cls = STRATEGY_KINDS.get(kind)
+        if cls is None:
             raise ValueError(f"unknown strategy kind: {kind!r}")
+        sconf = dataclasses.replace(cfg.strategy, **entry.get("overrides", {}))
+        strats.append(cls(name, entry.get("version", "v1"), sconf))
     return strats

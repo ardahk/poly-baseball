@@ -185,6 +185,7 @@ def cmd_walk_forward(args, cfg):
                 "require_consistent_champion": not args.allow_mixed_champions,
                 "max_top_day_profit_share": args.max_top_day_profit_share,
                 "max_top_game_profit_share": args.max_top_game_profit_share,
+                "multiplicity_correction": args.multiplicity_correction,
             }
             manifest = walkforward.prepare_manifest(
                 cfg, cfg.engine.db_path, args.start, args.folds,
@@ -278,6 +279,12 @@ def main():
                            default=rule_defaults["max_top_day_profit_share"])
     p_prepare.add_argument("--max-top-game-profit-share", type=float,
                            default=rule_defaults["max_top_game_profit_share"])
+    p_prepare.add_argument("--multiplicity-correction",
+                           choices=["reality_check", "none"],
+                           default=rule_defaults["multiplicity_correction"],
+                           help="how the promotion bar scales with candidate count "
+                                "(reality_check: champion must beat the max-of-N "
+                                "game-bootstrap null)")
     p_prepare.add_argument("--allow-nonpositive-ci", action="store_true",
                            help="do not require the game-clustered CI lower bound above zero")
     p_prepare.add_argument("--allow-mixed-champions", action="store_true",

@@ -462,3 +462,56 @@ def test_counterfactual_waits_for_first_post_target_observation(tmp_path):
     ).fetchone()
     assert row["exec_bid"] == 0.53
     assert engine.pending_cf == []
+
+
+def _strategy_row(engine, market, outcome, ts, side=None, margin=None):
+    gs = engine.game_states[market.game_pk]
+    row = engine._decision_row(market, gs, "strategy", outcome,
+                               strategy_name="fade_v1_frozen", ts=ts, margin=margin)
+    row["side"] = side
+    return row
+
+
+def test_decision_buffer_aggregates_trivial_runs_exactly(tmp_path):
+    """SUM(weight) must reproduce per-tick funnel counts from fewer rows."""
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    rows: list[dict] = []
+    shadow: dict[str, int] = {}
+    outcomes = (["not_playful"] * 5 + ["small_move"] * 3 + ["signal"]
+                + ["not_playful"] * 4)
+    for i, outcome in enumerate(outcomes):
+        shadow[outcome] = shadow.get(outcome, 0) + 1
+        engine._buffer_decision(rows, _strategy_row(engine, market, outcome, ts=1000.0 + i))
+    engine._flush_stale_decision_runs(rows, now=1000.0 + len(outcomes) + 120)
+    engine.journal.record_decisions(rows)
+
+    summary = {
+        r["outcome"]: r["count"]
+        for r in engine.journal.decisions_summary()
+        if r["stage"] == "strategy"
+    }
+    assert summary == shadow
+    stored = engine.journal.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+    assert stored == 4  # 5x + 3x runs collapsed, signal verbatim, trailing 4x run
+
+
+def test_decision_buffer_keeps_near_miss_rows_verbatim(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    rows: list[dict] = []
+    engine._buffer_decision(rows, _strategy_row(engine, market, "no_edge", ts=1.0, margin=0.01))
+    engine._buffer_decision(rows, _strategy_row(engine, market, "no_edge", ts=2.0, margin=0.02))
+    assert len(rows) == 2                      # margin rows never aggregate
+    assert engine._decision_runs == {}
+    assert [r["margin"] for r in rows] == [0.01, 0.02]
+
+
+def test_decision_buffer_side_change_breaks_run(tmp_path):
+    engine = make_engine(tmp_path)
+    market = tracked_market(engine)
+    rows: list[dict] = []
+    engine._buffer_decision(rows, _strategy_row(engine, market, "no_edge", ts=1.0, side="Homers"))
+    engine._buffer_decision(rows, _strategy_row(engine, market, "no_edge", ts=2.0, side="Awayers"))
+    assert len(rows) == 1 and rows[0]["side"] == "Homers" and rows[0]["weight"] == 1
+    assert engine._decision_runs[("fade_v1_frozen", market.key)]["side"] == "Awayers"

@@ -16,7 +16,11 @@ from .journal import Journal
 from .provenance import canonical, code_identity, config_hash, digest
 from .state_model import brier_loss, clamp_probability, log_loss
 
-FORMAT_VERSION = 1
+# v2 adds the multiplicity-corrected significance gate. v1 manifests locked
+# their gate before the correction existed, so it is computed and REPORTED for
+# them but never gates retroactively.
+FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = {1, 2}
 HORIZONS = (5, 15, 30, 60)
 TRAIN_DAYS, VALIDATE_DAYS, TEST_DAYS, ROLL_DAYS = 28, 7, 7, 7
 
@@ -31,6 +35,12 @@ DEFAULT_PROMOTION_RULES = {
     "require_consistent_champion": True,
     "max_top_day_profit_share": 0.35,
     "max_top_game_profit_share": 0.35,
+    # Multiplicity: the champion is the max of N correlated candidates, so its
+    # own CI is not deflated for selection. White's Reality Check bootstraps
+    # the max over the joint game-resampled fleet, pricing that correlation.
+    "multiplicity_correction": "reality_check",   # reality_check | none
+    "reality_check_alpha": 0.05,
+    "reality_check_samples": 4000,
 }
 
 # Every table/column the causal replay or calibration consumes. Pinned
@@ -141,6 +151,12 @@ def prepare_manifest(cfg: Config, db_path: str, start_day: str, fold_count: int,
     for key in ("max_top_day_profit_share", "max_top_game_profit_share"):
         if not 0 <= promotion[key] <= 1:
             raise ValueError(f"{key} must be between 0 and 1")
+    if promotion["multiplicity_correction"] not in {"reality_check", "none"}:
+        raise ValueError("multiplicity_correction must be 'reality_check' or 'none'")
+    if not 0 < promotion["reality_check_alpha"] <= 0.5:
+        raise ValueError("reality_check_alpha must be in (0, 0.5]")
+    if promotion["reality_check_samples"] < 100:
+        raise ValueError("reality_check_samples must be at least 100")
     journal = Journal(db_path)
     try:
         data_hash = tape_digest(journal, folds)
@@ -181,7 +197,7 @@ def load_manifest(path: str, cfg: Config, journal: Journal) -> dict:
     manifest["manifest_sha256"] = supplied
     if supplied != actual:
         raise ValueError("preregistration checksum mismatch")
-    if manifest.get("format_version") != FORMAT_VERSION:
+    if manifest.get("format_version") not in SUPPORTED_FORMAT_VERSIONS:
         raise ValueError("unsupported walk-forward manifest version")
     if manifest.get("config_hash") != config_hash(cfg):
         raise ValueError("current config does not match the preregistered config")
@@ -206,15 +222,68 @@ def _sanitize(value):
     return value
 
 
-def _cluster_ci(values: dict[str, float], seed: str) -> list[float | None]:
-    samples = list(values.values())
-    if not samples:
+def _cluster_ci(values: dict[str, float], seed: str, alpha: float = 0.05,
+                samples: int = 2000) -> list[float | None]:
+    points = list(values.values())
+    if not points:
         return [None, None]
-    if len(samples) == 1:
-        return [samples[0], samples[0]]
+    if len(points) == 1:
+        return [points[0], points[0]]
     rng = random.Random(seed)
-    means = sorted(statistics.mean(rng.choices(samples, k=len(samples))) for _ in range(2000))
-    return [means[int(0.025 * len(means))], means[int(0.975 * len(means))]]
+    means = sorted(statistics.mean(rng.choices(points, k=len(points)))
+                   for _ in range(samples))
+    low = means[int(alpha / 2 * len(means))]
+    high = means[min(int((1 - alpha / 2) * len(means)), len(means) - 1)]
+    return [low, high]
+
+
+def _reality_check(game_pnls: dict[str, dict[str, float]],
+                   champion_pnls: dict[str, float], seed: str,
+                   samples: int = 4000, alpha: float = 0.05) -> dict:
+    """White (2000) Reality Check over the candidate fleet, clustered by game.
+
+    Null: no candidate has positive expected per-game P&L. Each candidate's
+    per-game series is recentered to zero mean; every bootstrap replicate draws
+    ONE game resample shared across all candidates (preserving their
+    correlation — they trade the same games) and records the max candidate
+    mean. The champion promotes only if its observed mean per-game P&L exceeds
+    the (1-alpha) quantile of that max-of-N null distribution. This is what
+    makes the promotion bar rise with the number of candidates tried.
+    """
+    games = sorted(set(champion_pnls).union(*game_pnls.values())) \
+        if game_pnls else sorted(champion_pnls)
+    result = {
+        "candidates": len(game_pnls), "games": len(games),
+        "alpha": alpha, "samples": samples,
+        "champion_mean_game_pnl": None, "max_null_q95": None,
+        "p_value": None, "passes": False,
+    }
+    if not games or not game_pnls or not champion_pnls:
+        return result
+    # A game a candidate did not trade contributes 0 — the mean is over the
+    # same game universe for every candidate and for the champion statistic.
+    t_obs = statistics.mean(champion_pnls.get(game, 0.0) for game in games)
+    count = len(games)
+    centered: list[list[float]] = []
+    for pnls in game_pnls.values():
+        series = [pnls.get(game, 0.0) for game in games]
+        mean = statistics.mean(series)
+        centered.append([value - mean for value in series])
+    rng = random.Random(seed)
+    max_stats = []
+    for _ in range(samples):
+        draw = [rng.randrange(count) for _ in range(count)]
+        max_stats.append(max(
+            sum(series[i] for i in draw) / count for series in centered
+        ))
+    max_stats.sort()
+    q95 = max_stats[min(int((1 - alpha) * samples), samples - 1)]
+    result.update(
+        champion_mean_game_pnl=t_obs, max_null_q95=q95,
+        p_value=(1 + sum(stat >= t_obs for stat in max_stats)) / (samples + 1),
+        passes=t_obs > q95,
+    )
+    return result
 
 
 def _bucket(value: float, width: float) -> str:
@@ -369,8 +438,51 @@ def _run_window(cfg: Config, journal: Journal, window: list[str], label: str,
     }
 
 
-def _aggregate_selected(folds: list[dict], rules: dict) -> dict:
+def _multiplicity_evidence(folds: list[dict], rules: dict,
+                           candidates_considered: int) -> dict:
+    """Reality-Check gate + Bonferroni diagnostic over the locked tests."""
+    game_pnls: dict[str, dict[str, float]] = {}
+    champion_pnls: dict[str, float] = {}
+    for fold in folds:
+        strategies = (fold.get("locked_test") or {}).get("strategies") or {}
+        for name, metrics in strategies.items():
+            games = (metrics.get("concentration") or {}).get("game") or {}
+            for game, pnl in games.items():
+                game_pnls.setdefault(name, {})[f"f{fold['fold']}:{game}"] = pnl
+        selected = fold.get("selected_strategy")
+        if selected and selected in strategies:
+            games = (strategies[selected].get("concentration") or {}).get("game") or {}
+            for game, pnl in games.items():
+                champion_pnls[f"f{fold['fold']}:{game}"] = pnl
+    candidates = max(candidates_considered, len(game_pnls), 1)
+    alpha = rules["reality_check_alpha"]
+    bonferroni_alpha = alpha / candidates
+    return {
+        "reality_check": _reality_check(
+            game_pnls, champion_pnls, seed="reality_check",
+            samples=rules["reality_check_samples"], alpha=alpha,
+        ),
+        # Diagnostic only: assumes independent candidates, so it over-penalizes
+        # a fleet that trades the same games. Two-sided CI at 2*(alpha/N) makes
+        # the LOWER bound the one-sided alpha/N bound.
+        "bonferroni": {
+            "candidates": candidates,
+            "alpha_per_test": bonferroni_alpha,
+            "champion_game_ci": _cluster_ci(
+                champion_pnls, "champion:bonferroni",
+                alpha=2 * bonferroni_alpha, samples=10000,
+            ),
+        },
+    }
+
+
+def _aggregate_selected(folds: list[dict], rules: dict,
+                        manifest_format_version: int = FORMAT_VERSION) -> dict:
     rules = {**DEFAULT_PROMOTION_RULES, **rules}
+    if manifest_format_version < 2:
+        # v1 preregistrations locked their gate before the multiplicity
+        # correction existed; report the numbers, never gate retroactively.
+        rules["multiplicity_correction"] = "none"
     chosen = [fold for fold in folds if fold.get("selected_strategy")]
     selected = [fold["locked_test"]["strategies"][fold["selected_strategy"]]
                 for fold in chosen]
@@ -392,6 +504,9 @@ def _aggregate_selected(folds: list[dict], rules: dict) -> dict:
             (row.get("top_game_profit_share", 0.0) for row in selected), default=0.0),
         "positive_test_folds": sum(row["net_pnl"] > 0 for row in selected),
     }
+    aggregate["multiplicity"] = _multiplicity_evidence(
+        folds, rules, aggregate["candidates_considered"],
+    )
     checks = {
         "min_round_trips": aggregate["round_trips"] >= rules["min_round_trips"],
         "min_trading_days": aggregate["trading_days"] >= rules["min_trading_days"],
@@ -410,6 +525,12 @@ def _aggregate_selected(folds: list[dict], rules: dict) -> dict:
             not rules["require_positive_game_cluster_ci_low"] or
             all(row["game_clustered_mean_pnl_ci95"][0] is not None and
                 row["game_clustered_mean_pnl_ci95"][0] > 0 for row in selected)
+        ),
+        # The champion is the max of N correlated candidates; it must beat the
+        # max-of-N null, so the bar automatically rises with candidate count.
+        "multiplicity_corrected_significance": (
+            rules["multiplicity_correction"] == "none"
+            or aggregate["multiplicity"]["reality_check"]["passes"]
         ),
     }
     aggregate["promotion_checks"] = checks
@@ -466,7 +587,8 @@ def evaluate_manifest(cfg: Config, db_path: str, manifest_path: str, output: str
             "manifest_sha256": manifest["manifest_sha256"],
             "folds": fold_results,
             "selected_champion_aggregate": _aggregate_selected(
-                fold_results, manifest["promotion_rules"]),
+                fold_results, manifest["promotion_rules"],
+                manifest_format_version=manifest.get("format_version", 1)),
         })
         result["result_sha256"] = digest(result)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -496,4 +618,17 @@ def print_result(result: dict) -> None:
     if len(agg.get("strategies_selected", [])) > 1:
         print("champions : " + ", ".join(agg["strategies_selected"])
               + " (mixed selection across folds)")
+    multiplicity = agg.get("multiplicity")
+    if multiplicity:
+        rc = multiplicity["reality_check"]
+        if rc["p_value"] is not None:
+            print(f"multiplicity: reality-check p={rc['p_value']:.4f} over "
+                  f"{rc['candidates']} candidates / {rc['games']} games "
+                  f"(champion {rc['champion_mean_game_pnl']:+.4f}/game vs "
+                  f"max-null q95 {rc['max_null_q95']:+.4f})")
+        bon = multiplicity["bonferroni"]
+        ci_low = bon["champion_game_ci"][0]
+        low = "n/a" if ci_low is None else f"{ci_low:+.4f}"
+        print(f"  bonferroni diagnostic: alpha/N={bon['alpha_per_test']:.5f}, "
+              f"champion one-sided CI low {low}")
     print("promotion gate: " + ("PASS" if agg["passes_preregistered_rules"] else "FAIL"))

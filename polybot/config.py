@@ -61,6 +61,41 @@ class StrategyConfig:
     # state was received to avoid double-counting the move.
     residual_anchor_lookback_secs: float = 30.0
     market_anchor_max_age_secs: float = 21600.0
+    # --- Phase 5 hypothesis-fleet kinds. Each block belongs to one strategy
+    # kind; registry entries in config.yaml override them per hypothesis. ---
+    # momentum: trade WITH a sharp move (continuation, not reversion)
+    momentum_require_model_agree: bool = False   # model fair must favor the move side
+    momentum_min_state_age_secs: float = 0.0     # >0: fire only when the last MLB state
+                                                 # change is at least this old (pure orderflow)
+    # event_reaction: buy the model-delta direction while the market still lags
+    event_max_age_secs: float = 30.0             # act only this soon after state receipt
+    event_min_model_delta: float = 0.04          # ignore low-impact state changes
+    event_min_underreaction: float = 0.02        # market must trail anchored fair by this
+    event_class: str = "any"                     # any|score_change|inning_change|bases_or_outs
+    event_min_inning: int = 1
+    # extreme_hold: buy an extreme-priced side, hold to settlement (fee ~ p(1-p))
+    extreme_min_price: float = 0.90
+    extreme_max_price: float = 0.97
+    extreme_min_inning: int = 7
+    extreme_max_inning: int = 99
+    extreme_require_model_agree: bool = False
+    extreme_model_agree_margin: float = 0.0      # model fair >= price + this
+    # settlement_hold: model-vs-market gap held to settlement (one fee leg)
+    hold_min_edge: float = 0.10
+    hold_max_inning: int = 6
+    hold_fair_source: str = "state"              # state|market_anchored
+    hold_side_filter: str = "any"                # any|home|away
+    # calibration_cell: model-free bias harvesting in a price/inning/side cell
+    cell_price_min: float = 0.0
+    cell_price_max: float = 1.0
+    cell_inning_min: int = 1
+    cell_inning_max: int = 99
+    cell_side: str = "home"                      # home|away|favorite|underdog|leader|trailer
+    # microstructure: book-shape/timing mechanisms
+    micro_mode: str = "spread_snap"              # spread_snap|stale_reprice|pregame_drift
+    micro_window_secs: float = 60.0
+    micro_min_reprice: float = 0.03
+    micro_spread_shock: float = 0.03
 
 
 @dataclass
@@ -96,6 +131,7 @@ class EngineConfig:
     causal_replay_latency_secs: float = 0.5  # fill on first BBO observed after this delay
     history_gap_reset_secs: float = 180.0    # discard rolling features after data outages
     counterfactual_max_lag_secs: float = 5.0  # late horizons become unavailable, not backfilled
+    decision_flush_secs: float = 60.0        # max age of a buffered run-length decision row
     state_model_path: str | None = None      # accepted empirical-state artifact; analytic if null
     report_timezone: str = "America/Los_Angeles"  # trading-day/report boundary
     live: bool = False

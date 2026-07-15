@@ -343,3 +343,218 @@ def test_ai_shadow_does_not_resubmit_while_pending():
     ai.wait_idle()
     assert judge.calls == 1
     ai.close()
+
+
+# ----------------------------------------------- Phase 5 fleet: new kinds
+
+from polybot.strategies import (
+    CalibrationCellStrategy,
+    EventReactionStrategy,
+    ExtremeHoldStrategy,
+    MicrostructureStrategy,
+    MomentumStrategy,
+    SettlementHoldStrategy,
+    STRATEGY_KINDS,
+)
+
+NOEDGE = dataclasses.replace(CFG, min_edge=-1.0, min_price=0.01, max_price=0.99)
+HOLD = dataclasses.replace(NOEDGE, take_profit=10.0, stop_loss=10.0,
+                           max_hold_secs=1e9, edge_exit=10.0)
+
+
+def live_gs(**kw):
+    defaults = dict(status="Live", inning=7, is_top=True, home_score=4, away_score=1)
+    defaults.update(kw)
+    return GameState(1, **defaults)
+
+
+def trending(prices, step=30.0):
+    h = PriceHistory(flip_band=0.03)
+    for i, p in enumerate(prices):
+        h.add(p, ts=i * step)
+    return h
+
+
+def kctx(history, gs, bid, ask, model_history=None, now=1000.0):
+    return StratContext(market=market(), history=history, game_state=gs,
+                        quote=MarketQuote("m1", bid, ask, bid, ask, ts=now),
+                        now=now, model_history=model_history)
+
+
+def test_momentum_buys_the_moving_side():
+    s = MomentumStrategy("momentum_fast_v1", "v1", NOEDGE)
+    h = trending([0.40, 0.42, 0.55, 0.60])       # +0.18 over the last 60s
+    d = s.evaluate(kctx(h, live_gs(), bid=0.59, ask=0.61))
+    assert d.outcome == "signal"
+    assert d.intent.token == "m1:LONG"           # rising home side
+
+
+def test_momentum_small_move_rejected_with_margin():
+    s = MomentumStrategy("momentum_fast_v1", "v1", NOEDGE)
+    h = trending([0.50, 0.51, 0.52, 0.53])
+    d = s.evaluate(kctx(h, live_gs(), bid=0.52, ask=0.54))
+    assert d.outcome == "small_move"
+    assert d.evaluation.margin < 0
+
+
+def test_momentum_model_agree_filter():
+    cfg = dataclasses.replace(NOEDGE, momentum_require_model_agree=True)
+    s = MomentumStrategy("momentum_confirmed_v1", "v1", cfg)
+    # Home trailing badly (fair low) but price spiking up -> model disagrees.
+    h = trending([0.40, 0.42, 0.55, 0.60])
+    gs = live_gs(inning=8, home_score=0, away_score=9)
+    d = s.evaluate(kctx(h, gs, bid=0.59, ask=0.61))
+    assert d.outcome == "model_disagrees"
+
+
+def test_event_reaction_trades_underreaction_in_model_direction():
+    s = EventReactionStrategy("news_underreact_v1", "v1", NOEDGE)
+    mh = ModelHistory(anchor_lookback_secs=30.0)
+    mh.add_price(0.50, ts=900.0)
+    gs0 = live_gs(inning=6, home_score=2, away_score=2)
+    gs0.received_at = 950.0
+    mh.observe_state(gs0, ts=950.0)
+    h = trending([0.50, 0.50, 0.50, 0.51])
+    ctx0 = kctx(h, gs0, bid=0.50, ask=0.52, model_history=mh, now=960.0)
+    s.evaluate(ctx0)                              # prime prev-state tracking
+    # Home scores 3: model jumps, market barely moves within 30s.
+    gs1 = live_gs(inning=6, home_score=5, away_score=2)
+    gs1.received_at = 970.0
+    mh.observe_state(gs1, ts=970.0)
+    ctx1 = kctx(h, gs1, bid=0.50, ask=0.52, model_history=mh, now=975.0)
+    d = s.evaluate(ctx1)
+    assert d.outcome == "signal"
+    assert d.intent.token == "m1:LONG"            # with the news, home side
+
+
+def test_event_reaction_class_filter_blocks_other_events():
+    cfg = dataclasses.replace(NOEDGE, event_class="score_change")
+    s = EventReactionStrategy("news_underreact_score_v1", "v1", cfg)
+    mh = ModelHistory(anchor_lookback_secs=30.0)
+    mh.add_price(0.50, ts=900.0)
+    gs0 = live_gs(inning=6, home_score=2, away_score=2, outs=0)
+    gs0.received_at = 950.0
+    mh.observe_state(gs0, ts=950.0)
+    h = trending([0.50, 0.50, 0.50, 0.51])
+    s.evaluate(kctx(h, gs0, bid=0.50, ask=0.52, model_history=mh, now=960.0))
+    gs1 = live_gs(inning=6, home_score=2, away_score=2, outs=2)   # outs only
+    gs1.received_at = 970.0
+    mh.observe_state(gs1, ts=970.0)
+    d = s.evaluate(kctx(h, gs1, bid=0.50, ask=0.52, model_history=mh, now=975.0))
+    assert d.outcome == "wrong_event_class"
+
+
+def test_extreme_hold_enters_band_and_holds_to_settlement():
+    cfg = dataclasses.replace(HOLD, extreme_min_price=0.90, extreme_max_price=0.97,
+                              extreme_min_inning=7)
+    s = ExtremeHoldStrategy("favorite_late_v1", "v1", cfg)
+    h = trending([0.90, 0.91, 0.92, 0.92])
+    d = s.evaluate(kctx(h, live_gs(inning=8, home_score=9, away_score=1),
+                        bid=0.91, ask=0.93))
+    assert d.outcome == "signal"
+    assert d.intent.token == "m1:LONG"
+    # Held position: no exit while live even at a big loss...
+    pos = Position(strategy="favorite_late_v1", market_key="m1", token="m1:LONG",
+                   team="Homers", qty=10.0, entry_price=0.93, opened_at=990.0)
+    exits = s.manage(kctx(h, live_gs(inning=9), bid=0.50, ask=0.52), [pos])
+    assert exits == []
+    # ...but settles on game final.
+    exits = s.manage(kctx(h, GameState(1, status="Final"), bid=0.99, ask=1.0), [pos])
+    assert len(exits) == 1 and "game final" in exits[0].reason
+
+
+def test_extreme_hold_outside_band_rejected():
+    cfg = dataclasses.replace(HOLD, extreme_min_price=0.90, extreme_min_inning=1)
+    s = ExtremeHoldStrategy("favorite_late_v1", "v1", cfg)
+    h = trending([0.60, 0.61, 0.60, 0.62])
+    d = s.evaluate(kctx(h, live_gs(), bid=0.61, ask=0.63))
+    assert d.outcome == "outside_price_band"
+
+
+def test_settlement_hold_buys_model_side_on_gap():
+    cfg = dataclasses.replace(HOLD, hold_min_edge=0.10, hold_max_inning=6)
+    s = SettlementHoldStrategy("settle_gap10_v1", "v1", cfg)
+    # Home leads 5-0 in the 6th: model fair >> 0.55 market price.
+    h = trending([0.54, 0.55, 0.55, 0.55])
+    d = s.evaluate(kctx(h, live_gs(inning=6, home_score=5, away_score=0),
+                        bid=0.54, ask=0.56))
+    assert d.outcome == "signal"
+    assert d.intent.token == "m1:LONG"
+
+
+def test_settlement_hold_side_filter():
+    cfg = dataclasses.replace(HOLD, hold_min_edge=0.10, hold_max_inning=6,
+                              hold_side_filter="away")
+    s = SettlementHoldStrategy("settle_away_v1", "v1", cfg)
+    h = trending([0.54, 0.55, 0.55, 0.55])
+    d = s.evaluate(kctx(h, live_gs(inning=6, home_score=5, away_score=0),
+                        bid=0.54, ask=0.56))
+    assert d.outcome == "side_filtered"
+
+
+def test_calibration_cell_leader_side():
+    cfg = dataclasses.replace(HOLD, cell_side="leader", cell_price_min=0.50,
+                              cell_price_max=0.62, cell_inning_min=4)
+    s = CalibrationCellStrategy("cell_leader_coinflip_v1", "v1", cfg)
+    h = trending([0.55, 0.56, 0.55, 0.56])
+    d = s.evaluate(kctx(h, live_gs(inning=5, home_score=3, away_score=2),
+                        bid=0.55, ask=0.57))
+    assert d.outcome == "signal"
+    assert d.intent.token == "m1:LONG"            # home leads and is in-band
+    tie = s.evaluate(kctx(h, live_gs(inning=5, home_score=3, away_score=3),
+                          bid=0.55, ask=0.57))
+    assert tie.outcome == "no_cell_side"
+
+
+def test_microstructure_stale_reprice():
+    cfg = dataclasses.replace(NOEDGE, micro_mode="stale_reprice",
+                              micro_window_secs=60.0, micro_min_reprice=0.03)
+    s = MicrostructureStrategy("stale_reprice_v1", "v1", cfg)
+    h = trending([0.50, 0.50, 0.50, 0.58])
+    gs = live_gs()
+    c1 = StratContext(market=market(), history=h, game_state=gs,
+                      quote=MarketQuote("m1", 0.49, 0.51, 0.49, 0.51, ts=100.0),
+                      now=100.0)
+    assert s.evaluate(c1).outcome in {"no_gap", "small_reprice"}
+    # 90s book gap, then a two-sided quote 8 cents higher.
+    c2 = StratContext(market=market(), history=h, game_state=gs,
+                      quote=MarketQuote("m1", 0.57, 0.59, 0.57, 0.59, ts=190.0),
+                      now=190.0)
+    d = s.evaluate(c2)
+    assert d.outcome == "signal"
+    assert d.intent.token == "m1:LONG"
+
+
+def test_microstructure_pregame_drift_fires_once():
+    cfg = dataclasses.replace(NOEDGE, micro_mode="pregame_drift",
+                              micro_min_reprice=0.03)
+    s = MicrostructureStrategy("pregame_drift_v1", "v1", cfg)
+    h = PriceHistory(flip_band=0.03)
+    h.add(0.50, ts=0.0)          # 30+ minutes pregame
+    h.add(0.56, ts=1900.0)       # first live tick, +6c drift
+    gs = live_gs(inning=1, home_score=0, away_score=0)
+    c = StratContext(market=market(), history=h, game_state=gs,
+                     quote=MarketQuote("m1", 0.55, 0.57, 0.55, 0.57, ts=1900.0),
+                     now=1900.0)
+    d = s.evaluate(c)
+    assert d.outcome == "signal"
+    assert d.intent.token == "m1:LONG"
+    assert s.evaluate(c).outcome == "already_fired"
+    s.reset_market("m1")
+    assert s.evaluate(c).outcome == "signal"      # replay boundary resets state
+
+
+def test_registry_kind_table_covers_all_deterministic_kinds():
+    assert set(STRATEGY_KINDS) == {
+        "fade", "state_residual", "market_anchored", "momentum",
+        "event_reaction", "extreme_hold", "settlement_hold",
+        "calibration_cell", "microstructure",
+    }
+
+
+def test_yaml_registry_builds_thirty_deterministic_strategies():
+    from polybot.config import load_config
+    cfg = load_config("config.yaml")
+    strats = [s for s in build_strategies(cfg) if s.kind != "ai_shadow"]
+    assert len(strats) == 30
+    assert len({s.name for s in strats}) == 30

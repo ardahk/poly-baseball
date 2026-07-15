@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     is_top INTEGER,
     home_score INTEGER,
     away_score INTEGER,
-    run_id TEXT
+    run_id TEXT,
+    weight REAL
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_market_ts
     ON decisions (market, ts);
@@ -259,6 +260,7 @@ _COLUMN_MIGRATIONS = {
     "decisions": {
         "run_id": "TEXT", "anchor_price": "REAL", "anchor_model": "REAL",
         "model_delta": "REAL", "residual": "REAL", "anchor_age": "REAL",
+        "weight": "REAL",
     },
     "paper_positions": {"entry_fee": "REAL NOT NULL DEFAULT 0"},
     "signals": {
@@ -273,6 +275,7 @@ _DECISION_COLUMNS = (
     "realized_vol", "fair_home", "anchor_price", "anchor_model", "model_delta",
     "residual", "anchor_age", "side", "price", "fair", "edge", "spread",
     "quote_age", "margin", "inning", "is_top", "home_score", "away_score", "run_id",
+    "weight",
 )
 
 
@@ -804,7 +807,7 @@ class Journal:
             where.append("ts < ?")
             params.append(end)
         rows = self.conn.execute(
-            f"""SELECT stage, outcome, strategy, COUNT(*) AS count
+            f"""SELECT stage, outcome, strategy, SUM(COALESCE(weight, 1)) AS count
                 FROM decisions
                 WHERE {' AND '.join(where)}
                 GROUP BY stage, outcome, strategy

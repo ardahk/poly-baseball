@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from polybot.broker import taker_fee
 from polybot.models import GameState
+from polybot.walkforward import _cluster_ci
 from polybot.winprob import home_win_probability
 
 DB = sys.argv[1] if len(sys.argv) > 1 else "/tmp/pb_check.db"
@@ -59,6 +60,7 @@ def main() -> None:
     # bucket -> {game_pk: [n_ticks, sum_pnl, sum_win]}  (cluster by game)
     cells: dict[tuple, dict] = {}
     tot: dict = {}
+    prereg: dict = {}   # the locked rule: inning <= 6 AND |gap| >= 0.10
     for r in con.execute(
             "SELECT market, ts, home_mid, home_bid, home_ask FROM price_ticks "
             "WHERE home_bid IS NOT NULL AND home_ask IS NOT NULL ORDER BY market, ts"):
@@ -87,7 +89,10 @@ def main() -> None:
         pnl = payout - ask - taker_fee(THETA, ask)   # settle pays no exit fee
         ib = "1-3" if gs.inning <= 3 else "4-6" if gs.inning <= 6 else "7+"
         gb = ".05-.10" if abs(gap) < .10 else ">=.10"
-        for bucket in (cells.setdefault((ib, gb), {}), tot):
+        buckets = [cells.setdefault((ib, gb), {}), tot]
+        if gs.inning <= 6 and abs(gap) >= 0.10:
+            buckets.append(prereg)
+        for bucket in buckets:
             g = bucket.setdefault(pk, [0, 0.0, 0.0])
             g[0] += 1; g[1] += pnl; g[2] += payout
 
@@ -96,26 +101,39 @@ def main() -> None:
         print("No qualifying moments.")
         return
 
-    def summarize(by_game: dict) -> tuple[int, int, float, float, float]:
+    def summarize(by_game: dict) -> tuple[int, int, float, float, float, float, float]:
         games = len(by_game)
         ticks = sum(v[0] for v in by_game.values())
         pnl_sum = sum(v[1] for v in by_game.values())
         win_sum = sum(v[2] for v in by_game.values())
         # per-game mean pnl/contract: each game votes once (honest clustering)
-        per_game = statistics.mean(v[1] / v[0] for v in by_game.values())
-        return games, ticks, 100 * win_sum / ticks, pnl_sum / ticks, per_game
+        per_game_values = {str(pk): v[1] / v[0] for pk, v in by_game.items()}
+        per_game = statistics.mean(per_game_values.values())
+        lo, hi = _cluster_ci(per_game_values, seed=f"markout:{ticks}")
+        return games, ticks, 100 * win_sum / ticks, pnl_sum / ticks, per_game, lo, hi
 
     print(f"db={DB}  model={LABEL}  min_gap={MIN_GAP}  theta={THETA}")
     print("Buy the model's favored side at market ask, hold to settlement.\n")
     print(f"{'inning':8}{'gap':10}{'games':>7}{'ticks':>8}{'win%':>8}"
-          f"{'pnl/tick':>11}{'pnl/game':>11}")
+          f"{'pnl/tick':>11}{'pnl/game':>11}{'ci95_game':>20}")
     for key in sorted(cells):
-        gm, tk, wp, pt, pg = summarize(cells[key])
-        print(f"{key[0]:8}{key[1]:10}{gm:>7}{tk:>8}{wp:>7.1f}%{pt:>11.4f}{pg:>11.4f}")
-    gm, tk, wp, pt, pg = summarize(tot)
-    print(f"\n{'ALL':8}{'':10}{gm:>7}{tk:>8}{wp:>7.1f}%{pt:>11.4f}{pg:>11.4f}")
+        gm, tk, wp, pt, pg, lo, hi = summarize(cells[key])
+        print(f"{key[0]:8}{key[1]:10}{gm:>7}{tk:>8}{wp:>7.1f}%{pt:>11.4f}{pg:>11.4f}"
+              f"{f'[{lo:+.4f}, {hi:+.4f}]':>20}")
+    gm, tk, wp, pt, pg, lo, hi = summarize(tot)
+    print(f"\n{'ALL':8}{'':10}{gm:>7}{tk:>8}{wp:>7.1f}%{pt:>11.4f}{pg:>11.4f}"
+          f"{f'[{lo:+.4f}, {hi:+.4f}]':>20}")
+
+    # The locked preregistered rule spans two inning cells; report it as one.
+    if prereg:
+        gm, tk, wp, pt, pg, lo, hi = summarize(prereg)
+        print(f"{'PREREG':8}{'<=6,>=.10':10}{gm:>7}{tk:>8}{wp:>7.1f}%{pt:>11.4f}"
+              f"{pg:>11.4f}{f'[{lo:+.4f}, {hi:+.4f}]':>20}")
+
     print("\npnl/game clusters by game (each game = one vote); trust it over "
           "pnl/tick.\nA cell needs many games AND pnl/game > +0.02 to be real.")
+    print("ci95_game is a 2000-sample bootstrap over per-game means "
+          "(criterion #2: lower bound > 0).")
 
 
 if __name__ == "__main__":

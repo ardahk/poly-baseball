@@ -28,6 +28,15 @@ from .state_model import load_probability_model
 from .volatility import PriceHistory
 log = logging.getLogger(__name__)
 
+# stage="strategy" outcomes journaled verbatim, one row per tick: anything
+# signal-adjacent (the review funnel's execution stages) or carrying a
+# near-miss margin. All other outcomes run-length aggregate into one row with
+# a `weight` count, so 30 strategies ticking every 2s don't multiply the
+# decisions table by identical consecutive rejections.
+VERBATIM_OUTCOMES = frozenset(
+    {"signal", "execution_cost", "no_quote", "stale_quote", "wide_spread"}
+)
+
 
 class Engine:
     def __init__(self, cfg: Config, dashboard: bool = False):
@@ -74,6 +83,10 @@ class Engine:
         # Active signal episodes: (strategy, market, token) -> last-fired ts. New
         # episodes register a signal; continuations refresh the timestamp only.
         self.active_signals: dict[tuple[str, str, str], float] = {}
+        # Run-length buffered stage="strategy" decision rows, keyed by
+        # (strategy, market). Each holds the FIRST row of a run of identical
+        # trivial outcomes; `weight` counts the ticks it stands for.
+        self._decision_runs: dict[tuple[str, str], dict] = {}
 
         self._last_discovery = 0.0
         self._last_game_poll = 0.0
@@ -187,6 +200,7 @@ class Engine:
         finally:
             for strat in self.strategy_objs:
                 strat.close()
+            self._flush_all_decision_runs()
             self.dashboard.close()
             self.journal.close()
 
@@ -432,6 +446,49 @@ class Engine:
     def _bump(self, reason: str) -> None:
         self.funnel[reason] = self.funnel.get(reason, 0) + 1
 
+    def _buffer_decision(self, rows: list[dict], row: dict) -> None:
+        """Run-length aggregate trivial stage="strategy" rows.
+
+        Signal-adjacent outcomes and near-miss rows (margin set) are journaled
+        verbatim. Anything else extends the buffered run for its
+        (strategy, market) when outcome+side repeat, so `decisions_summary`'s
+        SUM(weight) reproduces exact per-tick funnel counts from ~20-40x fewer
+        rows.
+        """
+        key = (row["strategy"], row["market"])
+        if row["outcome"] in VERBATIM_OUTCOMES or row.get("margin") is not None:
+            self._flush_decision_run(key, rows)
+            row["weight"] = 1
+            rows.append(row)
+            return
+        run = self._decision_runs.get(key)
+        if (run is not None and run["outcome"] == row["outcome"]
+                and run["side"] == row["side"]):
+            run["weight"] += 1
+            return
+        self._flush_decision_run(key, rows)
+        row["weight"] = 1
+        self._decision_runs[key] = row
+
+    def _flush_decision_run(self, key: tuple[str, str], rows: list[dict]) -> None:
+        run = self._decision_runs.pop(key, None)
+        if run is not None:
+            rows.append(run)
+
+    def _flush_stale_decision_runs(self, rows: list[dict], now: float) -> None:
+        cutoff = now - self.cfg.engine.decision_flush_secs
+        for key in [k for k, r in self._decision_runs.items() if r["ts"] <= cutoff]:
+            self._flush_decision_run(key, rows)
+
+    def _flush_all_decision_runs(self) -> None:
+        rows: list[dict] = []
+        for key in list(self._decision_runs):
+            self._flush_decision_run(key, rows)
+        try:
+            self.journal.record_decisions(rows)
+        except Exception:                            # noqa: BLE001
+            log.exception("failed to flush buffered decision rows on shutdown")
+
     def _decision_row(self, market: Market, gs: GameState, stage: str, outcome: str,
                       *, strategy_name: str | None = None,
                       ev=None, quote: MarketQuote | None = None,
@@ -493,6 +550,7 @@ class Engine:
                 self._evaluate_strategy(strat, ctx, gs, quote, now,
                                         day_start, day_end, day_key, rows,
                                         register_signal=not awaiting_post_state_quote)
+        self._flush_stale_decision_runs(rows, now)
         self.journal.record_decisions(rows)
 
     def _evaluate_strategy(self, strat, ctx, gs, quote, now,
@@ -503,7 +561,7 @@ class Engine:
         d = strat.evaluate(ctx)
         self._bump(d.outcome)
         ev = d.evaluation or (d.intent.evaluation if d.intent else None)
-        rows.append(self._decision_row(
+        self._buffer_decision(rows, self._decision_row(
             market, gs, "strategy", d.outcome, strategy_name=strat.name,
             ev=ev, quote=quote, quote_age=quote_age, ts=now,
         ))

@@ -84,6 +84,177 @@ strategies:
     kind: ai_shadow
     base: fade_v1_frozen
 
+  # ------------------------------------------------------------------------
+  # Phase 5 hypothesis fleet: 25 genuinely different mechanisms (30 total
+  # deterministic with the 5 controls above). Replay P&L on the ~32 recorded
+  # games is a LIVENESS check only — selection happens exclusively through
+  # the preregistered walk-forward gate with the multiplicity correction.
+  #
+  # Common override notes:
+  #   min_edge: -1.0                 disables the model-edge execution gate for
+  #                                  mechanisms whose claim is not model-based
+  #   take_profit/stop_loss: 10.0,   inert exits: hold to settlement (check_exit
+  #   max_hold_secs: 1e9,            always closes on game final first)
+  #   edge_exit: 10.0
+  # ------------------------------------------------------------------------
+
+  # -- momentum: in-game moves are information (refuted-fade inverted) --
+  - name: momentum_fast_v1
+    kind: momentum
+    hypothesis: "90s information moves continue rather than revert"
+    overrides: {min_edge: -1.0}
+  - name: momentum_slow_v1
+    kind: momentum
+    hypothesis: "slower info diffuses over minutes; ride 5-min moves longer"
+    overrides: {min_edge: -1.0, move_lookback_secs: 300, move_threshold: 0.12,
+                max_hold_secs: 1800}
+  - name: momentum_confirmed_v1
+    kind: momentum
+    hypothesis: "move + model agreeing on direction = real news, continuation"
+    overrides: {min_edge: -1.0, momentum_require_model_agree: true}
+  - name: momentum_orderflow_v1
+    kind: momentum
+    hypothesis: "moves with NO recent state change = informed flow ahead of the feed"
+    overrides: {min_edge: -1.0, momentum_min_state_age_secs: 120}
+
+  # -- event_reaction: with-the-news underreaction to a fresh state change --
+  - name: news_underreact_v1
+    kind: event_reaction
+    hypothesis: "market underreacts to state changes in the first 30s"
+    overrides: {min_edge: -1.0}
+  - name: news_underreact_score_v1
+    kind: event_reaction
+    hypothesis: "scoring plays specifically are underpriced at receipt"
+    overrides: {min_edge: -1.0, event_class: score_change, event_min_model_delta: 0.06}
+  - name: news_underreact_bases_v1
+    kind: event_reaction
+    hypothesis: "subtle base/out events are the least attended, most underpriced"
+    overrides: {min_edge: -1.0, event_class: bases_or_outs, event_min_model_delta: 0.03}
+  - name: news_late_v1
+    kind: event_reaction
+    hypothesis: "late-inning high-leverage events lag the most"
+    overrides: {min_edge: -1.0, event_min_inning: 7, event_min_model_delta: 0.05}
+
+  # -- extreme_hold: fee is theta*p*(1-p); cost collapses at the tails --
+  - name: favorite_late_v1
+    kind: extreme_hold
+    hypothesis: "late favorites >=0.90 are underpriced; near-zero fee zone"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: favorite_mid_v1
+    kind: extreme_hold
+    hypothesis: "mid-game favorites 0.85-0.95 keep drifting up"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.85, extreme_max_price: 0.95,
+                extreme_min_inning: 4, extreme_max_inning: 6,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: favorite_model_agree_v1
+    kind: extreme_hold
+    hypothesis: "model-confirmed favorites only; agreement filters dead cats"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.88, extreme_min_inning: 1,
+                extreme_require_model_agree: true, extreme_model_agree_margin: 0.02,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: longshot_value_v1
+    kind: extreme_hold
+    hypothesis: "longshots with model support are underpriced (bias direction A)"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.03, extreme_max_price: 0.10,
+                extreme_min_inning: 1,
+                extreme_require_model_agree: true, extreme_model_agree_margin: 0.05,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: anti_longshot_v1
+    kind: extreme_hold
+    hypothesis: "favorite-longshot bias: longshots overpriced, their complement cheap"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_inning: 1,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+  # -- settlement_hold: model-market gap held to settlement (one fee leg) --
+  - name: settle_gap10_v1
+    kind: settlement_hold
+    hypothesis: "the locked 2026-07-12 prereg rule as a forward paper test"
+    overrides: {take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: settle_gap05_early_v1
+    kind: settlement_hold
+    hypothesis: "market is slow to price game state in innings 1-3"
+    overrides: {hold_min_edge: 0.05, hold_max_inning: 3,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: settle_anchored_v1
+    kind: settlement_hold
+    hypothesis: "team-strength-corrected disagreement via the frozen pregame anchor"
+    overrides: {hold_fair_source: market_anchored, hold_min_edge: 0.08,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: settle_away_v1
+    kind: settlement_hold
+    hypothesis: "model overrates homes ~5-9pts, so away-side gaps are trustworthy"
+    overrides: {hold_side_filter: away, hold_min_edge: 0.08,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+  # -- calibration_cell: model-free bias harvesting, hold to settlement --
+  - name: cell_home_dog_v1
+    kind: calibration_cell
+    hypothesis: "home underdogs 0.30-0.45 are systematically underpriced"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: home, cell_price_min: 0.30, cell_price_max: 0.45,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: cell_away_fav_late_v1
+    kind: calibration_cell
+    hypothesis: "away favorites finish; crowd overweights late home comebacks"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: away, cell_price_min: 0.75, cell_price_max: 0.90,
+                cell_inning_min: 7,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: cell_leader_coinflip_v1
+    kind: calibration_cell
+    hypothesis: "market is slow to credit actual leads still priced near a coin flip"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: leader, cell_price_min: 0.50, cell_price_max: 0.62,
+                cell_inning_min: 4,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: cell_trailer_cheap_v1
+    kind: calibration_cell
+    hypothesis: "early comebacks are underpriced at 0.15-0.25"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: trailer, cell_price_min: 0.15, cell_price_max: 0.25,
+                cell_inning_max: 5,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: cell_extras_home_v1
+    kind: calibration_cell
+    hypothesis: "last-at-bat advantage in extra innings is underpriced"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: home, cell_price_min: 0.40, cell_price_max: 0.65,
+                cell_inning_min: 10,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+  # -- microstructure: book-shape and timing mechanisms --
+  - name: spread_shock_v1
+    kind: microstructure
+    hypothesis: "a spread shock that re-tightens reveals the informed side"
+    overrides: {min_edge: -1.0, micro_mode: spread_snap, micro_min_reprice: 0.02}
+  - name: stale_reprice_v1
+    kind: microstructure
+    hypothesis: "the reprice after a one-sided book gap carries the outage's news"
+    overrides: {min_edge: -1.0, micro_mode: stale_reprice}
+  - name: pregame_drift_v1
+    kind: microstructure
+    hypothesis: "late pregame money is informed (lineups/pitchers); ride it early"
+    overrides: {min_edge: -1.0, micro_mode: pregame_drift, max_hold_secs: 5400}
+
 engine:
   poll_interval_secs: 2
   game_state_interval_secs: 10

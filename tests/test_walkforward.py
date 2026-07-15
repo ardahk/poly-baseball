@@ -1,4 +1,5 @@
 import json
+import random
 from datetime import datetime
 
 import pytest
@@ -240,3 +241,97 @@ def test_manifest_detects_config_change(tmp_path):
 def test_sanitize_replaces_non_finite_floats():
     dirty = {"a": float("nan"), "b": [1.0, float("inf")], "c": {"d": -float("inf")}}
     assert walkforward._sanitize(dirty) == {"a": None, "b": [1.0, None], "c": {"d": None}}
+
+
+# ------------------------------------------- multiplicity-corrected promotion
+
+def _fleet_game_pnls(n_candidates, n_games, edge=0.0, champion="s00", seed=7):
+    """Correlated zero-mean fleet; `edge` is added to the champion per game."""
+    rng = random.Random(seed)
+    common = [rng.gauss(0, 0.3) for _ in range(n_games)]
+    fleet = {}
+    for c in range(n_candidates):
+        name = f"s{c:02d}"
+        fleet[name] = {
+            f"g{g}": common[g] + rng.gauss(0, 0.2) + (edge if name == champion else 0.0)
+            for g in range(n_games)
+        }
+    return fleet, dict(fleet[champion])
+
+
+def test_reality_check_rejects_zero_edge_fleet():
+    fleet, champ = _fleet_game_pnls(30, 120, edge=0.0)
+    best = max(fleet, key=lambda n: sum(fleet[n].values()))
+    rc = walkforward._reality_check(fleet, dict(fleet[best]), seed="t", samples=1000)
+    assert rc["passes"] is False
+    assert rc["p_value"] > 0.05
+    assert rc["candidates"] == 30 and rc["games"] == 120
+
+
+def test_reality_check_passes_large_true_edge():
+    fleet, champ = _fleet_game_pnls(30, 200, edge=0.25)
+    rc = walkforward._reality_check(fleet, champ, seed="t", samples=1000)
+    assert rc["passes"] is True
+    assert rc["p_value"] < 0.05
+
+
+def test_reality_check_deterministic_under_seed():
+    fleet, champ = _fleet_game_pnls(10, 50, edge=0.1)
+    a = walkforward._reality_check(fleet, champ, seed="fixed", samples=500)
+    b = walkforward._reality_check(fleet, champ, seed="fixed", samples=500)
+    assert a == b
+
+
+def test_reality_check_empty_inputs_fail_closed():
+    rc = walkforward._reality_check({}, {}, seed="t", samples=100)
+    assert rc["passes"] is False and rc["p_value"] is None
+
+
+def _fold_with_games(pnl_by_strategy, selected, fold=1):
+    strategies = {}
+    for name, game_pnls in pnl_by_strategy.items():
+        metrics = _fake_metrics(sum(game_pnls.values()))
+        metrics["concentration"] = {"game": game_pnls}
+        strategies[name] = metrics
+    return {"fold": fold, "selected_strategy": selected,
+            "candidates_considered": len(strategies),
+            "locked_test": {"strategies": strategies}}
+
+
+def test_v2_gate_blocks_lucky_max_of_fleet():
+    rng = random.Random(3)
+    fold = _fold_with_games(
+        {f"s{c}": {f"g{g}": rng.gauss(0, 0.3) for g in range(40)} for c in range(20)},
+        selected=None,
+    )
+    best = max(fold["locked_test"]["strategies"],
+               key=lambda n: sum(fold["locked_test"]["strategies"][n]["concentration"]["game"].values()))
+    fold["selected_strategy"] = best
+    rules = {**_FAKE_RULES, "reality_check_samples": 800}
+    agg = walkforward._aggregate_selected([fold], rules, manifest_format_version=2)
+    assert agg["multiplicity"]["reality_check"]["passes"] is False
+    assert agg["promotion_checks"]["multiplicity_corrected_significance"] is False
+    assert agg["passes_preregistered_rules"] is False
+
+
+def test_v1_manifest_reports_multiplicity_without_gating():
+    rng = random.Random(3)
+    fold = _fold_with_games(
+        {f"s{c}": {f"g{g}": rng.gauss(0, 0.3) for g in range(40)} for c in range(20)},
+        selected="s0",
+    )
+    rules = {**_FAKE_RULES, "reality_check_samples": 800}
+    agg = walkforward._aggregate_selected([fold], rules, manifest_format_version=1)
+    assert "reality_check" in agg["multiplicity"]          # still reported
+    assert agg["promotion_checks"]["multiplicity_corrected_significance"] is True
+
+
+def test_bonferroni_diagnostic_uses_alpha_over_n():
+    fold = _fold_with_games(
+        {"a": {"g1": 1.0, "g2": 2.0}, "b": {"g1": 0.5, "g2": 0.1}}, selected="a",
+    )
+    agg = walkforward._aggregate_selected([fold], dict(_FAKE_RULES),
+                                          manifest_format_version=2)
+    bon = agg["multiplicity"]["bonferroni"]
+    assert bon["candidates"] == 2
+    assert bon["alpha_per_test"] == pytest.approx(0.05 / 2)
