@@ -96,6 +96,8 @@ class StrategyConfig:
     micro_window_secs: float = 60.0
     micro_min_reprice: float = 0.03
     micro_spread_shock: float = 0.03
+    micro_pregame_lookback_secs: float = 1800.0  # pregame_drift: how far back to
+                                                 # measure the late-pregame move
 
 
 @dataclass

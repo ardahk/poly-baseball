@@ -552,9 +552,16 @@ def test_registry_kind_table_covers_all_deterministic_kinds():
     }
 
 
-def test_yaml_registry_builds_thirty_deterministic_strategies():
+def test_yaml_registry_builds_deterministic_strategies():
+    # 5 frozen controls + 25 v1 hypothesis fleet + 25 v2 retune fleet (2026-07-17),
+    # minus liquidity_fade_v2 (retired 2026-07-19, cash below min stake).
     from polybot.config import load_config
     cfg = load_config("config.yaml")
     strats = [s for s in build_strategies(cfg) if s.kind != "ai_shadow"]
-    assert len(strats) == 30
-    assert len({s.name for s in strats}) == 30
+    assert len(strats) == 54
+    assert len({s.name for s in strats}) == 54
+    # Every v2 pairs with a frozen v1 of the same kind (v1 left untouched).
+    names = {s.name for s in strats}
+    for s in strats:
+        if s.name.endswith("_v2") and s.name != "liquidity_fade_v2":
+            assert s.name[:-1] + "1" in names, s.name

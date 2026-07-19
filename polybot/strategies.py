@@ -826,7 +826,7 @@ class MicrostructureStrategy(Strategy):
         if ctx.game_state.inning > 1:
             self._fired.add(key)     # missed the window for this game
             return self._reject(detail, "too_late")
-        past = ctx.history.price_ago(1800.0)
+        past = ctx.history.price_ago(cfg.micro_pregame_lookback_secs)
         if past is None:
             return self._reject(detail, "no_pregame_history")
         drift = ctx.history.last - past
@@ -835,7 +835,8 @@ class MicrostructureStrategy(Strategy):
             return self._reject(detail, "small_reprice",
                                 margin=abs(drift) - cfg.micro_min_reprice)
         self._fired.add(key)
-        reason = f"pregame_drift {drift:+.3f} over the last 30 pregame minutes"
+        reason = (f"pregame_drift {drift:+.3f} over the last "
+                  f"{cfg.micro_pregame_lookback_secs / 60:.0f} pregame minutes")
         return self._finish(ctx, detail, drift > 0, drift, reason)
 
     def manage(self, ctx: StratContext, positions: list[Position]) -> list[ExitIntent]:

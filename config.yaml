@@ -65,17 +65,13 @@ ai:
 # asynchronously (skipped when ai.enabled is false). Delete this block to fall
 # back to the built-in frozen controls + Phase 3 variants + ai_shadow.
 strategies:
-  - name: fade_v1_frozen       # the control: today's strategy config, unchanged
-    kind: fade
+  - name: fade_v1_frozen       # RETIRED (cash < min stake, see retired_strategies below);
+    kind: fade                 # kept defined only because ai_shadow uses it as `base`
   - name: fade_tight           # cheap config-only variant: stricter move/edge
     kind: fade
     overrides:
       move_threshold: 0.15
       min_edge: 0.09
-  - name: liquidity_fade_v2    # unchanged-book shock control; time-stable features
-    kind: fade
-    overrides:
-      sampling_stable_features: true
   - name: state_residual_v1    # fade market overreaction to a received state change
     kind: state_residual
   - name: market_anchor_v1     # team-strength-aware fair from frozen pregame market
@@ -254,6 +250,226 @@ strategies:
     kind: microstructure
     hypothesis: "late pregame money is informed (lineups/pitchers); ride it early"
     overrides: {min_edge: -1.0, micro_mode: pregame_drift, max_hold_secs: 5400}
+
+  # ========================================================================
+  # v2 retune fleet (2026-07-17). v1 entries above stay FROZEN so their
+  # preregistered track record is preserved; these v2s apply the
+  # frequency-based rule from the observed funnel over the ~17-20 recorded
+  # live games (fade controls entered 15-20 markets each; every v1 above
+  # entered only ONE). Rule:
+  #   * mechanisms structurally capable of many trades but starved by an
+  #     over-tight entry gate  -> LOOSEN entry (more trades, small-% exit kept)
+  #   * mechanisms that are rare by design (late-only, no-recent-state,
+  #     book-shape events)      -> keep them rare but go for BIGGER % per trade
+  #   * hold-to-settlement cells (already big-%) -> WIDEN the price/inning
+  #     cell just enough to trade a handful of games (walk-forward liveness)
+  #   * dead triggers (0 trades) -> fix the trigger that never fired
+  # Each v2's `note` records the dominant v1 reject reason it targets.
+  # ========================================================================
+
+  # -- momentum: high-capacity (thousands of small_move rejects) -> more trades --
+  - name: momentum_fast_v2
+    kind: momentum
+    version: v2
+    note: "v1 208 signals but small_move=3625; lower move gate for more trades"
+    overrides: {min_edge: -1.0, move_threshold: 0.05}
+  - name: momentum_slow_v2
+    kind: momentum
+    version: v2
+    note: "v1 small_move=3468 at move_threshold 0.12; loosen to 0.08"
+    overrides: {min_edge: -1.0, move_lookback_secs: 300, move_threshold: 0.08,
+                max_hold_secs: 1800}
+  - name: momentum_confirmed_v2
+    kind: momentum
+    version: v2
+    note: "v1 small_move + model_disagrees; loosen move, keep model-agree filter"
+    overrides: {min_edge: -1.0, move_threshold: 0.05, momentum_require_model_agree: true}
+  - name: momentum_orderflow_v2
+    kind: momentum
+    version: v2
+    note: "rare by design (no recent state); keep gate, ride bigger % per trade"
+    overrides: {min_edge: -1.0, momentum_min_state_age_secs: 90,
+                take_profit: 0.30, stop_loss: 0.30, max_hold_secs: 3600}
+
+  # -- event_reaction: loosen model-delta / underreaction gates -> more trades --
+  - name: news_underreact_v2
+    kind: event_reaction
+    version: v2
+    note: "v1 small_model_move=815 + no_underreaction; lower both thresholds"
+    overrides: {min_edge: -1.0, event_min_model_delta: 0.02,
+                event_min_underreaction: 0.01, event_max_age_secs: 45}
+  - name: news_underreact_score_v2
+    kind: event_reaction
+    version: v2
+    note: "v1 took 0 trades (delta 0.06 too high for score plays); loosen + widen age"
+    overrides: {min_edge: -1.0, event_class: score_change, event_min_model_delta: 0.03,
+                event_min_underreaction: 0.01, event_max_age_secs: 60}
+  - name: news_underreact_bases_v2
+    kind: event_reaction
+    version: v2
+    note: "v1 small_model_move=596; base/out impacts are tiny, drop delta to 0.015"
+    overrides: {min_edge: -1.0, event_class: bases_or_outs, event_min_model_delta: 0.015,
+                event_min_underreaction: 0.01}
+  - name: news_late_v2
+    kind: event_reaction
+    version: v2
+    note: "rare by design (inning>=7); hold the high-leverage underreaction to settlement"
+    overrides: {min_edge: -1.0, event_min_inning: 7, event_min_model_delta: 0.03,
+                event_min_underreaction: 0.01,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+  # -- extreme_hold: already big-% (hold to settlement); widen band for liveness --
+  - name: favorite_late_v2
+    kind: extreme_hold
+    version: v2
+    note: "v1 1 trade, outside_price_band=576; widen [0.85,0.99], inning>=6"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.85, extreme_max_price: 0.99, extreme_min_inning: 6,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: favorite_mid_v2
+    kind: extreme_hold
+    version: v2
+    note: "v1 took 0 trades (outside_price_band=1820); widen band + inning window"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.80, extreme_max_price: 0.97,
+                extreme_min_inning: 3, extreme_max_inning: 7,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: favorite_model_agree_v2
+    kind: extreme_hold
+    version: v2
+    note: "v1 971 signals but 1 trade; lower price floor + agree margin for more games"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.82, extreme_min_inning: 1,
+                extreme_require_model_agree: true, extreme_model_agree_margin: 0.01,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: longshot_value_v2
+    kind: extreme_hold
+    version: v2
+    note: "v1 took 0 (model rarely backs a longshot by +5pts); widen band, ease margin"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.03, extreme_max_price: 0.15, extreme_min_inning: 1,
+                extreme_require_model_agree: true, extreme_model_agree_margin: 0.02,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: anti_longshot_v2
+    kind: extreme_hold
+    version: v2
+    note: "v1 1 trade, outside_price_band=3002; widen [0.85,0.99]"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.85, extreme_max_price: 0.99, extreme_min_inning: 1,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+  # -- settlement_hold: big-%; lower gap + widen innings + ease exec gate -> more --
+  - name: settle_gap10_v2
+    kind: settlement_hold
+    version: v2
+    note: "v1 small_gap=1627 + late_inning=1511; gap 0.06, innings <=8"
+    overrides: {min_edge: 0.02, hold_min_edge: 0.06, hold_max_inning: 8,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: settle_gap05_early_v2
+    kind: settlement_hold
+    version: v2
+    note: "v1 late_inning=3331 + execution_cost=233; innings <=5, gap 0.04, ease exec"
+    overrides: {min_edge: 0.02, hold_min_edge: 0.04, hold_max_inning: 5,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: settle_anchored_v2
+    kind: settlement_hold
+    version: v2
+    note: "v1 small_gap=2247; anchored gap 0.05, innings <=8"
+    overrides: {min_edge: 0.02, hold_fair_source: market_anchored, hold_min_edge: 0.05,
+                hold_max_inning: 8,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: settle_away_v2
+    kind: settlement_hold
+    version: v2
+    note: "v1 1243 signals but 1 trade; away gap 0.05, innings <=8"
+    overrides: {min_edge: 0.02, hold_side_filter: away, hold_min_edge: 0.05,
+                hold_max_inning: 8,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+  # -- calibration_cell: big-%; widen the price/inning cell for liveness --
+  - name: cell_home_dog_v2
+    kind: calibration_cell
+    version: v2
+    note: "v1 outside_cell_price=2210; widen home band to [0.25,0.48]"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: home, cell_price_min: 0.25, cell_price_max: 0.48,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: cell_away_fav_late_v2
+    kind: calibration_cell
+    version: v2
+    note: "v1 outside_cell_price=1111; widen [0.68,0.95], inning>=6"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: away, cell_price_min: 0.68, cell_price_max: 0.95,
+                cell_inning_min: 6,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: cell_leader_coinflip_v2
+    kind: calibration_cell
+    version: v2
+    note: "v1 1161 signals but 1 trade; widen leader band [0.48,0.68], inning>=3"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: leader, cell_price_min: 0.48, cell_price_max: 0.68,
+                cell_inning_min: 3,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: cell_trailer_cheap_v2
+    kind: calibration_cell
+    version: v2
+    note: "v1 outside_cell_price=1562; widen trailer band [0.12,0.32], inning<=6"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: trailer, cell_price_min: 0.12, cell_price_max: 0.32,
+                cell_inning_max: 6,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+  - name: cell_extras_home_v2
+    kind: calibration_cell
+    version: v2
+    note: "v1 took 0 (no extra-inning games); relax to last-at-bat 9th+ home edge"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                cell_side: home, cell_price_min: 0.40, cell_price_max: 0.65,
+                cell_inning_min: 9,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+  # -- microstructure: fix the dead triggers; loosen the shock detector --
+  - name: spread_shock_v2
+    kind: microstructure
+    version: v2
+    note: "v1 no_spread_shock=3298; lower shock/reprice, widen window -> more trades"
+    overrides: {min_edge: -1.0, micro_mode: spread_snap, micro_spread_shock: 0.02,
+                micro_min_reprice: 0.015, micro_window_secs: 90}
+  - name: stale_reprice_v2
+    kind: microstructure
+    version: v2
+    note: "v1 took 0 (no_gap=3808); 60s gap never happens at 2s polling, drop to 20s"
+    overrides: {min_edge: -1.0, micro_mode: stale_reprice, micro_window_secs: 20,
+                micro_min_reprice: 0.02}
+  - name: pregame_drift_v2
+    kind: microstructure
+    version: v2
+    note: "v1 took 0 (30-min pregame history absent); use 15-min lookback (new knob)"
+    overrides: {min_edge: -1.0, micro_mode: pregame_drift, max_hold_secs: 5400,
+                micro_pregame_lookback_secs: 900, micro_min_reprice: 0.02}
+
+# Retired models: cash balance fell below risk.stake_usd (the minimum stake
+# needed to open any trade), so the broker rejects every candidate with
+# "insufficient cash". Not in the active registry above (except fade_v1_frozen,
+# which stays only because ai_shadow references it as `base`). Record as of
+# 2026-07-19:
+retired_strategies:
+  - name: liquidity_fade_v2    # cash $3.75, below $5 min stake
+  - name: fade_v1_frozen       # cash $4.64, below $5 min stake
 
 engine:
   poll_interval_secs: 2
