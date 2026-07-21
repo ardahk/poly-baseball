@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the README leaderboard daily after MLB games settle
+
+[Timer]
+# Runs after the 11:30 UTC backup, once all overnight US games are final.
+OnCalendar=*-*-* 12:00:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,11 +1,50 @@
-# polybot — Polymarket MLB mean-reversion bot
+# ⚾ polybot — a Polymarket MLB trading laboratory
 
-Trades Polymarket US baseball moneyline markets on short-horizon overreactions:
-when a "playful" game's price swings hard and a win-probability model
-(inning / outs / bases / score) says the move overshot, the bot buys the
-undervalued side, targeting small gains (default +12% take profit, -30% stop).
+A single Python process watches live MLB moneyline markets on Polymarket US and
+runs **dozens of frozen strategies side-by-side**, each on its own paper ledger,
+to find out which market inefficiencies actually pay after fees. It trades
+short-horizon overreactions: when a "playful" game's price swings hard and a
+win-probability model (inning / outs / bases / score) disagrees, strategies act
+on it — some fade the move, some ride it, some just harvest a calibration bias
+and hold to settlement.
 
-Several frozen strategies run side-by-side with separate paper ledgers:
+Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
+
+## 🏆 Live leaderboard — top performers
+
+> Paper-trading track record, updated automatically once a day. Ranked by
+> **overall account return**; percentages only.
+
+<!-- STATS:START -->
+_Updated 2026-07-21 04:33 UTC · paper trading · percentages only · top 5 of qualifying strategies (≥10 closed trades)._
+
+| | Strategy | Trades | Win % | Avg / Trade | Best Trade | Overall Return |
+|:--:|---|--:|--:|--:|--:|--:|
+| 🥇 | `news_late_v2` | 47 | 53% | +26.0% | +733% | **+66.9%** |
+| 🥈 | `settle_gap10_v2` | 40 | 38% | +19.4% | +567% | **+57.8%** |
+| 🥉 | `settle_away_v2` | 36 | 36% | -0.8% | +545% | **+27.9%** |
+| ④ | `settle_gap05_early_v2` | 38 | 42% | +9.7% | +506% | **+13.1%** |
+| ⑤ | `cell_extras_home_v2` | 11 | 64% | +18.8% | +98% | **+7.4%** |
+
+**What each one does**
+
+- 🥇 **`news_late_v2`** — Buys the lag after late-inning, high-leverage events — the slowest to price in.
+- 🥈 **`settle_gap10_v2`** — Holds a model-vs-market gap to settlement (one fee leg) — the preregistered rule, live.
+- 🥉 **`settle_away_v2`** — Holds away-side gaps to settlement — the model overrates home teams.
+- ④ **`settle_gap05_early_v2`** — Holds early-inning model-market gaps to settlement.
+- ⑤ **`cell_extras_home_v2`** — Buys the home last-at-bat advantage in extra innings.
+<!-- STATS:END -->
+
+<sub>**Avg / Trade** = mean P&L per closed round trip · **Best Trade** = single
+best round trip · **Overall Return** = paper account vs. its starting bankroll.
+Small samples are noisy — strategies need a minimum number of closed trades to
+appear.</sub>
+
+## How it trades
+
+Every strategy is a **frozen variant** competing on one shared market/game
+stream with its own paper ledger, so their track records are directly
+comparable. The original fade **controls** are:
 
 - **fade_v1_frozen / fade_tight** — original absolute-model fade controls.
 - **liquidity_fade_v2** — the unchanged-book shock control with volatility and
@@ -15,6 +54,16 @@ Several frozen strategies run side-by-side with separate paper ledgers:
 - **market_anchor_v1** — freezes the pregame market probability, then transfers
   model changes onto it in log-odds space so team-strength bias largely cancels.
 - **ai_shadow** — asynchronous, optional judge over the frozen fade control.
+
+On top of these runs a **hypothesis fleet** of ~25 genuinely different
+mechanisms grouped by kind — `momentum` (trade *with* a move), `event_reaction`
+(buy the market's lag after a game event), `extreme_hold` /
+`calibration_cell` (harvest a favorite-longshot or home/leader bias, held to
+settlement), `settlement_hold` (a model-vs-market gap held to one fee leg), and
+`microstructure` (book-shape and timing signals). Selection happens only through
+a preregistered walk-forward gate — the leaderboard is a track record, not a
+promotion. Each mechanism's one-line summary shows up next to it in the
+leaderboard when it ranks.
 
 ## Setup
 

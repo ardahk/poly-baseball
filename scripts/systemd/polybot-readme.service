@@ -1,0 +1,11 @@
+[Unit]
+Description=Polybot README leaderboard daily refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/poly-baseball
+ExecStart=/home/ubuntu/poly-baseball/scripts/update_readme.sh
+Nice=10
