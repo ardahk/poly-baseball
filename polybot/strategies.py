@@ -68,6 +68,22 @@ class StratContext:
         """Per-contract taker fee paid to open at `entry_price` and later close."""
         return taker_fee(self.fee_theta, entry_price) + taker_fee(self.fee_theta, exit_price)
 
+    def all_in_cost(self, entry_price: float, holds_to_settlement: bool) -> float:
+        """Per-contract cost of a full round trip: fees plus spread crossing.
+
+        A settlement hold pays ONE fee leg (redemption is free, see
+        `PaperBroker.settle`) and crosses the spread once. An intraday exit pays
+        two fee legs and crosses twice. That difference is worth ~2x and is why
+        the two are gated separately.
+        """
+        half_spread = (self.quote.home_spread / 2.0) if self.quote else 0.0
+        if holds_to_settlement:
+            return taker_fee(self.fee_theta, entry_price) + half_spread
+        # Exit fee is priced at the entry price: it is the best available
+        # estimate before knowing where the exit lands, and theta*p*(1-p) is
+        # flat enough near the money that the error is small.
+        return 2.0 * taker_fee(self.fee_theta, entry_price) + 2.0 * half_spread
+
     @property
     def quote_age(self) -> float | None:
         return None if self.quote is None else self.now - self.quote.ts
@@ -211,6 +227,20 @@ class Strategy:
             ev.margin = net_edge - cfg.min_edge
             return Decision(evaluation=ev, outcome="execution_cost",
                             signal_candidate=True)
+        # Cost floor. Deliberately independent of `min_edge`: the whole
+        # hypothesis fleet sets min_edge to -1.0 to opt out of the *model* gate,
+        # which silently opted them out of the fee check above too. This one
+        # compares the trade's own upside against what it costs to put on, so it
+        # applies to model-free mechanisms as well.
+        if cfg.cost_floor_multiple > 0:
+            holds = cfg.take_profit >= 1.0        # inert exits => hold to settlement
+            cost = ctx.all_in_cost(exec_price, holds)
+            # Upside per contract at the target, capped by settlement at 1.0.
+            upside = min(exec_price * cfg.take_profit, 1.0 - exec_price)
+            if upside < cfg.cost_floor_multiple * cost:
+                ev.margin = upside - cfg.cost_floor_multiple * cost
+                return Decision(evaluation=ev, outcome="cost_floor",
+                                signal_candidate=True)
         intent = Intent(token=sig.token, side_team=sig.side_team,
                         signal_price=sig.price, fair=sig.fair, move=sig.move,
                         edge=net_edge, reason=sig.reason, evaluation=ev)

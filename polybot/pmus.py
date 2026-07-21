@@ -153,7 +153,19 @@ def _parse_market(m: dict, include_closed: bool = False) -> Market | None:
         long_team=long_team,
         tick_size=float(m.get("orderPriceMinTickSize") or 0.01),
         start_time=_parse_iso(m.get("gameStartTime") or m.get("startDate")),
+        fee_coefficient=_fee_coefficient(m.get("feeCoefficient")),
     )
+
+
+def _fee_coefficient(raw) -> float | None:
+    """Venue taker fee coefficient, ignoring absent or nonsensical values."""
+    try:
+        theta = float(raw)
+    except (TypeError, ValueError):
+        return None
+    # Published schedule is 0 (fee-free categories) through 0.07 (crypto).
+    # Anything outside that is a payload change we should not silently trust.
+    return theta if 0.0 <= theta <= 0.5 else None
 
 
 def _iso(ts: float) -> str:

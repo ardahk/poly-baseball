@@ -28,6 +28,13 @@ class StrategyConfig:
     max_price: float = 0.85              # don't buy tokens above this
     max_spread: float = 0.06             # skip entries if best ask - best bid is wider
     strong_stake_max_spread: float = 0.03  # larger stake only when spread is tight
+    # Cost floor: require upside-at-target >= this multiple of the all-in cost
+    # (fees + spread crossing). 0 disables. Independent of `min_edge`, which the
+    # hypothesis fleet sets to -1.0 and thereby skipped the fee check entirely.
+    # Fee is theta*p*(1-p), so cost as a share of notional runs ~7.9% at p=0.10
+    # down to ~0.9% at p=0.90 for a settlement hold; this gate is what stops a
+    # strategy from trading where the fee is larger than the move it is chasing.
+    cost_floor_multiple: float = 0.0
     # Exit (fractions of entry price)
     take_profit: float = 0.12            # +12% -> close
     stop_loss: float = 0.10              # -10% -> close
@@ -109,6 +116,12 @@ class RiskConfig:
     max_stake_per_market: float = 20.0
     daily_loss_limit_usd: float = 25.0   # kill switch per strategy
     starting_cash: float = 100.0         # paper account size per strategy
+    # Second-chance capital. An account that cannot fund `stake_usd` is dead:
+    # it stops trading and its return freezes near -100%. Give it one top-up,
+    # then retire it permanently. Deposits are tracked in `deposited` so they
+    # can never be mistaken for profit.
+    revival_deposit_usd: float = 50.0
+    max_revivals: int = 1
 
 
 @dataclass
@@ -147,6 +160,10 @@ class Config:
     ai: AIConfig = field(default_factory=AIConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     strategies: list[dict] = field(default_factory=list)  # frozen-variant registry
+    # Names that must not open new positions: refuted by preregistration, or
+    # insolvent past their second chance. They keep their ledgers and settle any
+    # open position, but the engine refuses new entries for them.
+    retired_strategies: list[str] = field(default_factory=list)
 
 
 def _apply(dc, data: dict):
@@ -168,6 +185,12 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         _apply(cfg.engine, raw.get("engine"))
         if isinstance(raw.get("strategies"), list):
             cfg.strategies = raw["strategies"]
+        # Accepts either bare names or {name: ...} mappings, matching the
+        # `strategies:` block's shape.
+        for entry in raw.get("retired_strategies") or []:
+            name = entry.get("name") if isinstance(entry, dict) else entry
+            if name:
+                cfg.retired_strategies.append(str(name))
     if not os.environ.get("ANTHROPIC_API_KEY"):
         cfg.ai.enabled = False
     return cfg

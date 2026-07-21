@@ -3,12 +3,22 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from decimal import Decimal, ROUND_HALF_EVEN
 
 from .models import Position
 
 log = logging.getLogger(__name__)
+
+
+# Published Polymarket US schedule, verified 2026-07-21 against
+# https://docs.polymarket.us/fees AND against the live gateway payload, which
+# reports feeCoefficient=0.06 on every MLB market including the moneyline.
+# Third-party pages quoting "sports = 0.05" describe the legacy *global*
+# Polymarket (help.polymarket.com), a different venue.
+TAKER_THETA = 0.06
+MAKER_THETA = -0.0125   # negative: makers are PAID
 
 
 def taker_fee(theta: float, price: float, qty: float = 1.0) -> float:
@@ -19,6 +29,33 @@ def taker_fee(theta: float, price: float, qty: float = 1.0) -> float:
     `PaperBroker.fee` applies the venue's banker's rounding for actual cash flows.
     """
     return theta * qty * price * (1.0 - price)
+
+
+def maker_rebate(price: float, qty: float = 1.0,
+                 theta: float = MAKER_THETA) -> float:
+    """Rebate CREDITED to a maker fill, as a positive number.
+
+    Makers pay no fee and receive `-theta * qty * p * (1-p)`. This is not free
+    money: resting an order buys adverse selection, measured at -1.12c/contract
+    on this tape versus a +0.22c rebate (docs/research-log.md, Session 1 §6).
+    Naked liquidity provision is net NEGATIVE. Use `maker_edge_vs_taker` rather
+    than the rebate alone when deciding anything.
+    """
+    return -theta * qty * price * (1.0 - price)
+
+
+def maker_edge_vs_taker(price: float, half_spread: float,
+                        adverse_selection: float,
+                        taker_theta: float = TAKER_THETA) -> float:
+    """Per-contract advantage of resting an order over crossing the spread.
+
+    Taker pays the half spread plus the fee. Maker pays neither, but eats
+    `adverse_selection` (a positive cost) and collects the rebate. Positive
+    result means maker execution is cheaper for the same exposure.
+    """
+    taker_cost = half_spread + taker_fee(taker_theta, price)
+    maker_cost = adverse_selection - maker_rebate(price)
+    return taker_cost - maker_cost
 
 
 def parse_token(token: str) -> tuple[str, str]:
@@ -37,30 +74,79 @@ class PaperBroker:
     """
 
     def __init__(self, strategies: list[str], starting_cash: float, slippage: float = 0.0,
-                 taker_fee_theta: float = 0.0):
+                 taker_fee_theta: float = 0.0, revival_deposit_usd: float = 0.0,
+                 max_revivals: int = 0):
         self.slippage = slippage
         self.taker_fee_theta = taker_fee_theta
+        self.revival_deposit_usd = revival_deposit_usd
+        self.max_revivals = max_revivals
         self.cash: dict[str, float] = {s: starting_cash for s in strategies}
         self.positions: dict[str, dict[str, Position]] = {s: {} for s in strategies}
         self.realized: dict[str, float] = {s: 0.0 for s in strategies}
         self.closes: dict[str, int] = {s: 0 for s in strategies}
         self.last_fee: dict[str, float] = {s: 0.0 for s in strategies}
+        # Lifecycle. `deposited` is every dollar ever put in (starting cash plus
+        # revival top-ups) and is the ONLY correct denominator for return %.
+        self.deposited: dict[str, float] = {s: starting_cash for s in strategies}
+        self.revivals: dict[str, int] = {s: 0 for s in strategies}
+        self.last_revival_ts: dict[str, float | None] = {s: None for s in strategies}
+        self.retired_at: dict[str, float | None] = {s: None for s in strategies}
 
-    def fee(self, price: float, qty: float) -> float:
+    # ------------------------------------------------------------- lifecycle
+
+    def is_retired(self, strategy: str) -> bool:
+        return self.retired_at.get(strategy) is not None
+
+    def check_solvency(self, strategy: str, min_stake: float) -> str | None:
+        """Revive or retire an account that can no longer open a position.
+
+        An account that cannot fund the minimum stake is dead: it stops trading
+        and its return freezes near -100%, which silently poisons every
+        cross-strategy comparison. Give it one top-up, then retire it for good.
+
+        Returns "revived", "retired", or None if nothing changed.
+        """
+        if self.is_retired(strategy) or self.cash[strategy] >= min_stake:
+            return None
+        if self.revivals[strategy] < self.max_revivals and self.revival_deposit_usd > 0:
+            self.cash[strategy] += self.revival_deposit_usd
+            self.deposited[strategy] += self.revival_deposit_usd
+            self.revivals[strategy] += 1
+            self.last_revival_ts[strategy] = time.time()
+            log.warning("[%s] account died (cash %.2f < %.2f); second chance: +$%.2f "
+                        "(revival %d, total deposited $%.2f)", strategy,
+                        self.cash[strategy] - self.revival_deposit_usd, min_stake,
+                        self.revival_deposit_usd, self.revivals[strategy],
+                        self.deposited[strategy])
+            return "revived"
+        self.retired_at[strategy] = time.time()
+        log.warning("[%s] RETIRED: cash %.2f < %.2f after %d revival(s); "
+                    "total deposited $%.2f, ending equity $%.2f",
+                    strategy, self.cash[strategy], min_stake,
+                    self.revivals[strategy], self.deposited[strategy],
+                    self.cash[strategy])
+        return "retired"
+
+    def fee(self, price: float, qty: float, theta: float | None = None) -> float:
         """Exchange taker fee on an actual fill, rounded like the venue.
 
         Banker's rounding to the cent mirrors real cash flows. For pre-trade
         edge/exit decisions use the unrounded `taker_fee` free function instead.
+        `theta` overrides the configured coefficient with the venue's own
+        per-market value when the gateway reported one.
         """
-        raw = Decimal(str(self.taker_fee_theta)) * Decimal(str(qty)) \
+        th = self.taker_fee_theta if theta is None else theta
+        raw = Decimal(str(th)) * Decimal(str(qty)) \
             * Decimal(str(price)) * (Decimal("1") - Decimal(str(price)))
         return float(raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN))
 
     def open(self, strategy: str, market_key: str, token: str, team: str,
-             price: float, stake_usd: float) -> Position | None:
+             price: float, stake_usd: float, theta: float | None = None) -> Position | None:
+        if self.is_retired(strategy):
+            return None
         fill = min(price + self.slippage, 0.999)
         qty = stake_usd / fill
-        fee = self.fee(fill, qty)
+        fee = self.fee(fill, qty, theta)
         cost = qty * fill + fee
         if cost > self.cash[strategy]:
             log.info("[%s] insufficient cash for %s", strategy, team)
@@ -75,13 +161,14 @@ class PaperBroker:
         self.positions[strategy][token] = pos
         return pos
 
-    def close(self, strategy: str, token: str, price: float) -> tuple[Position, float, float] | None:
+    def close(self, strategy: str, token: str, price: float,
+              theta: float | None = None) -> tuple[Position, float, float] | None:
         """Returns (position, fill_price, pnl_usd)."""
         pos = self.positions[strategy].pop(token, None)
         if pos is None:
             return None
         fill = max(price - self.slippage, 0.001)
-        fee = self.fee(fill, pos.qty)
+        fee = self.fee(fill, pos.qty, theta)
         proceeds = pos.qty * fill - fee
         self.cash[strategy] += proceeds
         pnl = proceeds - pos.cost
@@ -130,6 +217,14 @@ class PaperBroker:
             self.cash[strategy] = float(state["cash"])
             self.realized[strategy] = float(state["realized"])
             self.closes[strategy] = int(state["closes"])
+            # Older rows predate the lifecycle columns; fall back to the
+            # configured starting cash so `deposited` is never zero.
+            deposited = state.get("deposited") if hasattr(state, "get") else None
+            self.deposited[strategy] = float(
+                deposited if deposited is not None else self.deposited[strategy])
+            self.revivals[strategy] = int(state.get("revivals") or 0)
+            self.last_revival_ts[strategy] = state.get("last_revival_ts")
+            self.retired_at[strategy] = state.get("retired_at")
             restored = True
         for position in positions:
             if position.strategy not in self.positions:

@@ -19,6 +19,7 @@ _KNOBS = {
     "small_model_move": "strategy.residual_min_model_delta",
     "anchor_stale": "strategy.residual_response_secs/market_anchor_max_age_secs",
     "execution_cost": "strategy.min_edge (net of fees + spread)",
+    "cost_floor": "strategy.cost_floor_multiple (upside at target vs all-in cost)",
 }
 
 

@@ -8,7 +8,7 @@ import json
 from collections import deque
 from dataclasses import asdict
 
-from . import mlb, pmus, provenance, strategy
+from . import lifecycle, mlb, pmus, provenance, strategy
 from .broker import PaperBroker
 from .config import Config
 from .dashboard import TerminalDashboard
@@ -34,7 +34,8 @@ log = logging.getLogger(__name__)
 # a `weight` count, so 30 strategies ticking every 2s don't multiply the
 # decisions table by identical consecutive rejections.
 VERBATIM_OUTCOMES = frozenset(
-    {"signal", "execution_cost", "no_quote", "stale_quote", "wide_spread"}
+    {"signal", "execution_cost", "cost_floor", "no_quote", "stale_quote",
+     "wide_spread"}
 )
 
 
@@ -60,6 +61,8 @@ class Engine:
         self.broker = PaperBroker(
             self.strategies, cfg.risk.starting_cash, slippage=0.0,
             taker_fee_theta=cfg.engine.paper_taker_fee_theta,
+            revival_deposit_usd=cfg.risk.revival_deposit_usd,
+            max_revivals=cfg.risk.max_revivals,
         )
         self.journal = Journal(cfg.engine.db_path)
         self.run_id = self.journal.start_run(
@@ -98,8 +101,39 @@ class Engine:
         # orphaned positions so their games get polled to settlement.
         self._restore_paper_account()
         self._restore_pending_cf()
+        self._check_lifecycle()
         self.journal.save_paper_state(self.broker)
         self.session_realized = dict(self.broker.realized)
+
+    def _check_lifecycle(self) -> None:
+        """Revive or retire insolvent accounts, and log every transition.
+
+        Runs at startup and after each batch of closes. An account that silently
+        falls below the minimum stake stops trading but keeps appearing in the
+        standings, so every such transition must be recorded, not inferred.
+        """
+        # Config-level retirements (refuted by preregistration, or manually
+        # shut down) are applied first and are not lifecycle events -- they are
+        # a standing decision, not something that just happened.
+        for strategy in self.cfg.retired_strategies:
+            if strategy in self.broker.retired_at and not self.broker.is_retired(strategy):
+                self.broker.retired_at[strategy] = time.time()
+                log.info("[%s] retired by config (refuted or shut down)", strategy)
+
+        for strategy in self.strategies:
+            event = self.broker.check_solvency(strategy, self.cfg.risk.stake_usd)
+            if event is None:
+                continue
+            self._event("%s %s (cash $%.2f, deposited $%.2f)", strategy, event,
+                        self.broker.cash[strategy], self.broker.deposited[strategy])
+            lifecycle.record(
+                strategy=strategy, event=event,
+                cash=self.broker.cash[strategy],
+                deposited=self.broker.deposited[strategy],
+                revivals=self.broker.revivals[strategy],
+                closes=self.broker.closes[strategy],
+                realized=self.broker.realized[strategy],
+            )
 
     def _restore_paper_account(self) -> None:
         accounts, saved_positions = self.journal.paper_state(self.strategies)
@@ -307,6 +341,7 @@ class Engine:
                             fee_usd=0.0, commit=False,
                         )
                         self._event("[%s] SETTLE %s @ %.3f ($%+.2f)", strat, position.team, fill, pnl)
+            self._check_lifecycle()
             self.journal.save_paper_state(self.broker, commit=False)
 
     def _should_poll_game_state(self, market: Market, now: float) -> bool:
@@ -414,14 +449,22 @@ class Engine:
                         or quote.ts < gs.received_at:
                     continue
                 ctx = StratContext(market, self.histories[market.key], gs, quote, now,
-                                   fee_theta=self.cfg.engine.paper_taker_fee_theta,
+                                   fee_theta=(market.fee_coefficient
+                                              if market.fee_coefficient is not None
+                                              else self.cfg.engine.paper_taker_fee_theta),
                                    model_history=self.model_histories.get(market.key))
                 for ex in strat.manage(ctx, [pos]):
                     self._close(strat.name, ex.position, ex.price, ex.reason, fair=ex.fair)
 
+    def _theta_for(self, market_key: str) -> float | None:
+        """Venue fee coefficient for a market, or None to use the config default."""
+        market = self.markets.get(market_key)
+        return market.fee_coefficient if market else None
+
     def _close(self, strat: str, pos, price: float, reason: str,
                fair: float | None = None):
-        result = self.broker.close(strat, pos.token, price)
+        result = self.broker.close(strat, pos.token, price,
+                                   theta=self._theta_for(pos.market_key))
         if result is None:
             return
         position, fill, pnl = result
@@ -435,6 +478,7 @@ class Engine:
                                       intended_price=price, slippage=fill - price,
                                       exit_kind=strategy.exit_kind(reason),
                                       fee_usd=self.broker.last_fee[strat], commit=False)
+            self._check_lifecycle()
             self.journal.save_paper_state(self.broker, commit=False)
         scfg = self.strategy_by_name[strat].config
         cooldown = scfg.stop_loss_cooldown_secs \
@@ -544,7 +588,9 @@ class Engine:
             if awaiting_post_state_quote:
                 quote = None
             ctx = StratContext(market, self.histories[market.key], gs, quote, now,
-                               fee_theta=self.cfg.engine.paper_taker_fee_theta,
+                               fee_theta=(market.fee_coefficient
+                                          if market.fee_coefficient is not None
+                                          else self.cfg.engine.paper_taker_fee_theta),
                                model_history=self.model_histories.get(market.key))
             for strat in self.strategy_objs:
                 self._evaluate_strategy(strat, ctx, gs, quote, now,
@@ -597,7 +643,8 @@ class Engine:
         entry_price = ctx.entry_price(intent.token)
         reason = f"{intent.reason}; spread {quote.home_spread:.3f}; stake ${stake:.0f}"
         pos = self.broker.open(strat.name, market.key, intent.token,
-                               intent.side_team, entry_price, stake)
+                               intent.side_team, entry_price, stake,
+                               theta=market.fee_coefficient)
         if pos:
             self._bump("opened")
             rows.append(self._decision_row(

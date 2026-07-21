@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO))
 
 from polybot.config import load_config  # noqa: E402
 from polybot.journal import Journal  # noqa: E402
+from polybot.walkforward import _cluster_ci  # noqa: E402
 START = "<!-- STATS:START -->"
 END = "<!-- STATS:END -->"
 # The block is built with STAMP as a placeholder so two renders can be compared
@@ -90,42 +91,113 @@ def describe(name: str) -> str:
     return "—"
 
 
+def per_game_pnl(journal: Journal) -> dict[str, dict[str, float]]:
+    """Net P&L per contract per game, per strategy — the project's own metric.
+
+    Round trips within one game are heavily correlated (up to 36 strategies take
+    the same side of the same game), so trades are NOT independent samples.
+    Clustering by game is what `docs/research-log.md` established as the honest
+    unit and what `scripts/prereg_eval.py` tests against.
+    """
+    rows = journal.conn.execute(
+        """SELECT c.strategy AS strategy, m.game_pk AS game_pk,
+                  SUM(c.pnl_usd) AS pnl, SUM(c.qty) AS qty
+           FROM trades c
+           JOIN markets m ON m.slug = c.market
+           WHERE c.action = 'CLOSE' AND m.game_pk IS NOT NULL AND c.qty > 0
+           GROUP BY c.strategy, m.game_pk"""
+    ).fetchall()
+    out: dict[str, dict[str, float]] = {}
+    for r in rows:
+        if r["qty"]:
+            out.setdefault(r["strategy"], {})[str(r["game_pk"])] = r["pnl"] / r["qty"]
+    return out
+
+
 def build_block(db_path: str, starting_cash: float, top: int, min_trades: int) -> str:
     journal = Journal(db_path)
     stats = journal.strategy_stats()
     equity = dict(journal.latest_equity())
+    capital = journal.paper_capital()
+    game_pnl = per_game_pnl(journal)
     journal.close()
 
     rows = []
     for s in stats:
-        eq = equity.get(s["strategy"])
+        name = s["strategy"]
+        eq = equity.get(name)
         if eq is None or s["trades"] < min_trades:
             continue
-        ret = 100.0 * (eq - starting_cash) / starting_cash
+        acct = capital.get(name) or {}
+        # Return is against every dollar deposited, so a second-chance top-up
+        # can never masquerade as a gain.
+        deposited = acct.get("deposited") or starting_cash
+        ret = 100.0 * (eq - deposited) / deposited
         win = 100.0 * s["wins"] / s["trades"] if s["trades"] else 0.0
+        games = game_pnl.get(name, {})
+        lo, _hi = _cluster_ci(games, seed=f"leaderboard:{name}")
         rows.append({
-            "name": s["strategy"], "trades": s["trades"], "win": win,
-            "avg": s["avg_pnl_pct"] * 100, "best": s["best_pct"] * 100, "ret": ret,
+            "name": name, "trades": s["trades"], "win": win,
+            # Net of both taker fee legs. The gross number flattered every
+            # strategy by 3-7 points and is no longer published.
+            "avg": (s["avg_net_pct"] or 0.0) * 100,
+            "best": (s["best_net_pct"] or 0.0) * 100, "ret": ret,
+            "games": len(games), "ci_lo": lo,
+            "proven": lo is not None and lo > 0 and len(games) >= min_trades,
+            "retired": bool(acct.get("retired_at")),
         })
     rows.sort(key=lambda r: r["ret"], reverse=True)
-    rows = rows[:top]
+    proven = [r for r in rows if r["proven"]]
 
-    lines = [
-        START,
-        f"_Paper trading · percentages only · top {top} of qualifying strategies "
-        f"(≥{min_trades} closed trades) · standings last changed {STAMP}._",
+    lines = [START]
+    if not proven:
+        # Publishing a podium here would present noise as a track record: the
+        # current top entries all turn negative if their best 3 trades are
+        # removed, and none clears the project's own bar.
+        best = rows[0] if rows else None
+        lines += [
+            f"_Paper trading · percentages only · net of fees · "
+            f"last checked {STAMP}._",
+            "",
+            "**No strategy has cleared the bar yet.** A strategy is only listed "
+            "here once its per-game clustered mean P&L has a bootstrap 95% CI "
+            "lower bound above zero — the same test "
+            "[`scripts/prereg_eval.py`](scripts/prereg_eval.py) applies. "
+            f"{len(rows)} strategies currently qualify on trade count "
+            f"(≥{min_trades} closed) and **none** passes.",
+            "",
+            "Ranking by raw return would put a strategy on top whose entire "
+            "edge is two or three lucky settlements, so the standings stay "
+            "empty until something is actually distinguishable from luck.",
+        ]
+        if best is not None:
+            lines += [
+                "",
+                f"_Closest so far: `{best['name']}` at {best['ret']:+.1f}% over "
+                f"{best['trades']} trades across {best['games']} games — "
+                f"CI lower bound {best['ci_lo']:+.4f}/contract, still below zero._",
+            ]
+        lines.append(END)
+        return "\n".join(lines)
+
+    shown = proven[:top]
+    lines += [
+        f"_Paper trading · percentages only · net of fees · top {len(shown)} of "
+        f"strategies clearing the per-game bootstrap bar · standings last "
+        f"changed {STAMP}._",
         "",
-        "| | Strategy | Trades | Win % | Avg / Trade | Best Trade | Overall Return |",
-        "|:--:|---|--:|--:|--:|--:|--:|",
+        "| | Strategy | Trades | Games | Win % | Net / Trade | Best Trade | Overall Return |",
+        "|:--:|---|--:|--:|--:|--:|--:|--:|",
     ]
-    for i, r in enumerate(rows):
+    for i, r in enumerate(shown):
         medal = MEDALS[i] if i < len(MEDALS) else f"{i + 1}"
         lines.append(
-            f"| {medal} | `{r['name']}` | {r['trades']} | {r['win']:.0f}% | "
-            f"{r['avg']:+.1f}% | {r['best']:+.0f}% | **{r['ret']:+.1f}%** |"
+            f"| {medal} | `{r['name']}` | {r['trades']} | {r['games']} | "
+            f"{r['win']:.0f}% | {r['avg']:+.1f}% | {r['best']:+.0f}% | "
+            f"**{r['ret']:+.1f}%** |"
         )
     lines += ["", "**What each one does**", ""]
-    for i, r in enumerate(rows):
+    for i, r in enumerate(shown):
         medal = MEDALS[i] if i < len(MEDALS) else f"{i + 1}."
         lines.append(f"- {medal} **`{r['name']}`** — {describe(r['name'])}")
     lines.append(END)

@@ -10,36 +10,31 @@ and hold to settlement.
 
 Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 
-## 🏆 Live leaderboard — top performers
+## 🏆 Live leaderboard — what has actually cleared the bar
 
-> Paper-trading track record, updated automatically once a day. Ranked by
-> **overall account return**; percentages only.
+> Paper-trading track record, updated automatically once a day; percentages
+> only, **net of both taker fee legs**. A strategy is listed only once its
+> per-game clustered mean P&L has a bootstrap 95% CI lower bound above zero.
+> Ranking dozens of strategies by raw return just crowns the luckiest one, so
+> when nothing has passed, this section says so instead.
 
 <!-- STATS:START -->
-_Paper trading · percentages only · top 5 of qualifying strategies (≥10 closed trades) · standings last changed 2026-07-21 04:46 UTC._
+_Paper trading · percentages only · net of fees · last checked 2026-07-21 06:04 UTC._
 
-| | Strategy | Trades | Win % | Avg / Trade | Best Trade | Overall Return |
-|:--:|---|--:|--:|--:|--:|--:|
-| 🥇 | `news_late_v2` | 49 | 53% | +27.1% | +733% | **+73.7%** |
-| 🥈 | `settle_gap10_v2` | 42 | 38% | +21.0% | +567% | **+64.0%** |
-| 🥉 | `settle_away_v2` | 37 | 35% | -3.4% | +545% | **+21.8%** |
-| ④ | `settle_gap05_early_v2` | 38 | 42% | +9.7% | +506% | **+13.1%** |
-| ⑤ | `cell_home_dog_v2` | 35 | 46% | +14.2% | +251% | **+8.7%** |
+**No strategy has cleared the bar yet.** A strategy is only listed here once its per-game clustered mean P&L has a bootstrap 95% CI lower bound above zero — the same test [`scripts/prereg_eval.py`](scripts/prereg_eval.py) applies. 52 strategies currently qualify on trade count (≥10 closed) and **none** passes.
 
-**What each one does**
+Ranking by raw return would put a strategy on top whose entire edge is two or three lucky settlements, so the standings stay empty until something is actually distinguishable from luck.
 
-- 🥇 **`news_late_v2`** — Buys the lag after late-inning, high-leverage events — the slowest to price in.
-- 🥈 **`settle_gap10_v2`** — Holds a model-vs-market gap to settlement (one fee leg) — the preregistered rule, live.
-- 🥉 **`settle_away_v2`** — Holds away-side gaps to settlement — the model overrates home teams.
-- ④ **`settle_gap05_early_v2`** — Holds early-inning model-market gaps to settlement.
-- ⑤ **`cell_home_dog_v2`** — Model-free: buys home underdogs in a fixed price band, held to settlement.
+_Closest so far: `news_late_v2` at +73.7% over 49 trades across 29 games — CI lower bound -0.0070/contract, still below zero._
 <!-- STATS:END -->
 
-<sub>**Avg / Trade** = mean P&L per closed round trip · **Best Trade** = single
-best round trip · **Overall Return** = paper account vs. its starting bankroll.
-Small samples are noisy — strategies need a minimum number of closed trades to
-appear. The job checks daily but only commits when the standings actually move,
-so the timestamp reflects the last real change, not the last check.</sub>
+<sub>**Net / Trade** = mean P&L per closed round trip *after* both taker fee
+legs · **Best Trade** = single best round trip · **Overall Return** = paper
+account vs. **total capital deposited**, including any second-chance top-up, so
+a rescue deposit can never read as profit. **Games** is the clustering unit:
+round trips inside one game are correlated, so games — not trades — are the
+independent sample. The job checks daily but only commits when the standings
+actually move, so the timestamp reflects the last real change.</sub>
 
 ## How it trades
 
@@ -65,6 +60,31 @@ settlement), `settlement_hold` (a model-vs-market gap held to one fee leg), and
 a preregistered walk-forward gate — the leaderboard is a track record, not a
 promotion. Each mechanism's one-line summary shows up next to it in the
 leaderboard when it ranks.
+
+### What the tape has actually said so far
+
+Two results, both negative, both worth stating plainly:
+
+- **The preregistered hypothesis was rejected** out of sample on 2026-07-21
+  (66/60 games, mean −0.0304/contract against a >+0.02 bar). The
+  model-vs-market-gap family is retired and, per its own preregistration, is
+  *not* retuned or retested.
+- **Two thirds of all losses are transaction costs, not bad ideas** — taker
+  fees 46%, spread crossing 22%, signal only 32%. Before costs the mechanisms
+  are roughly break-even; the fee is what kills them.
+
+Because the fee is `θ·p(1−p)`, cost as a share of notional falls from ~7.9% at a
+price of 0.10 to ~0.9% at 0.90. So the **v3 generation changes how a mechanism
+pays, not what it predicts**: trade at the price tail, hold to one fee leg
+instead of two, and refuse any entry whose upside at target cannot cover its
+all-in cost (`strategy.cost_floor_multiple`). Maker execution was measured too —
+it halves the cost floor but [rescues nothing](docs/research-log.md), so live
+order placement stays unbuilt.
+
+Strategies that run out of money get **one** $50 second chance and are then
+retired for good; every transition is recorded in
+[`docs/strategy-lifecycle.md`](docs/strategy-lifecycle.md). Returns are measured
+against total capital deposited, so a rescue can never read as profit.
 
 ## Setup
 

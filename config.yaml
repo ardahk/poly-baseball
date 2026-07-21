@@ -462,14 +462,96 @@ strategies:
     overrides: {min_edge: -1.0, micro_mode: pregame_drift, max_hold_secs: 5400,
                 micro_pregame_lookback_secs: 900, micro_min_reprice: 0.02}
 
-# Retired models: cash balance fell below risk.stake_usd (the minimum stake
-# needed to open any trade), so the broker rejects every candidate with
-# "insufficient cash". Not in the active registry above (except fade_v1_frozen,
-# which stays only because ai_shadow references it as `base`). Record as of
-# 2026-07-19:
+  # ------------------------------------------------------------------------
+  # v3 — the COST generation (added 2026-07-21).
+  #
+  # The fleet audit found two thirds of all losses were transaction costs, not
+  # bad ideas: taker fees 46%, spread crossing 22%, signal only 32%
+  # (docs/research-log.md, Session 2 §2). So v3 does not chase new signal. Each
+  # entry changes only how a mechanism PAYS, and each states the defect it
+  # targets. Deliberately 4 variants, not 25: at 55 strategies a Bonferroni
+  # correction already demands |t| > 3.2, and the v1/v2 generations produced a
+  # leaderboard of pure noise (Session 2 §4).
+  #
+  # BAR, fixed before these traded: promotion requires a per-game clustered
+  # mean net P&L per contract with a bootstrap 95% CI lower bound > 0, over at
+  # least 60 games. Same test as scripts/prereg_eval.py. Nothing here is
+  # promoted on raw return.
+  #
+  # NOTE: no v3 of the model-vs-market-gap family. It was refuted out of sample
+  # on 2026-07-21 and is not retested. See retired_strategies below.
+  # ------------------------------------------------------------------------
+
+  # -- cost: trade where theta*p*(1-p) is small instead of where it is largest --
+  - name: favorite_tail_hold_v3
+    kind: extreme_hold
+    hypothesis: "at p>=0.88 a settlement hold costs ~0.9% of notional vs ~3.5%
+                 at the money, so a ~1% edge survives there and nowhere else"
+    overrides: {min_edge: -1.0, min_price: 0.01, max_price: 0.99,
+                extreme_min_price: 0.88, extreme_max_price: 0.97,
+                extreme_min_inning: 1,
+                cost_floor_multiple: 1.5,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+  # -- barrier geometry: v1/v2 needed a ~59% barrier hit rate and got 36-49% --
+  - name: momentum_fast_v3
+    kind: momentum
+    hypothesis: "momentum_fast entry with barriers matched to the thesis: cut
+                 losers fast, let continuation run (v1/v2 had it inverted)"
+    overrides: {min_edge: -1.0,
+                take_profit: 0.30, stop_loss: 0.12,
+                cost_floor_multiple: 1.5}
+  - name: momentum_slow_v3
+    kind: momentum
+    hypothesis: "same barrier correction on the 5-min variant: if the fix is
+                 real it generalises, if it only works on one it was noise"
+    overrides: {min_edge: -1.0, move_lookback_secs: 300, move_threshold: 0.12,
+                max_hold_secs: 1800,
+                take_profit: 0.30, stop_loss: 0.12,
+                cost_floor_multiple: 1.5}
+
+  # -- fee legs: two legs cost 5.64% of notional, one costs 2.33% --
+  - name: spread_shock_v3
+    kind: microstructure
+    hypothesis: "the spread-shock signal is real but cannot pay for two fee
+                 legs; hold it to settlement and pay one"
+    overrides: {min_edge: -1.0, micro_mode: spread_snap, micro_min_reprice: 0.02,
+                min_price: 0.01, max_price: 0.99,
+                cost_floor_multiple: 1.5,
+                take_profit: 10.0, stop_loss: 10.0, max_hold_secs: 1000000000,
+                edge_exit: 10.0}
+
+# Retired models. Two distinct reasons, both permanent:
+#
+#   (a) REFUTED — the preregistered walk-forward gate rejected the
+#       model-vs-market-gap hypothesis out of sample on 2026-07-21 (66/60 games,
+#       mean pnl/contract -0.0304 against a >+0.02 bar, CI [-0.1128, +0.0546]).
+#       See docs/research-log.md, Session 2 §1. Per the prereg's own instruction
+#       these are NOT retuned and NOT retested. Configs stay frozen; do not edit
+#       them, and do not add v3s of this family.
+#
+#   (b) INSOLVENT — burned through both the starting bankroll and the one-time
+#       second-chance deposit (risk.revival_deposit_usd). The engine now detects
+#       this automatically and writes docs/strategy-lifecycle.md; this list is
+#       the manual override that also keeps them out of the active registry.
+#
 retired_strategies:
+  # (a) refuted by preregistration, 2026-07-21
+  - name: state_residual_v1      # the preregistered rule itself
+  - name: market_anchor_v1       # same family: model-vs-market gap
+  - name: settle_gap10_v1
+  - name: settle_gap10_v2
+  - name: settle_gap05_early_v1
+  - name: settle_gap05_early_v2
+  - name: settle_anchored_v1
+  - name: settle_anchored_v2
+  - name: settle_away_v1
+  - name: settle_away_v2
+  # (b) insolvent
   - name: liquidity_fade_v2    # cash $3.75, below $5 min stake
   - name: fade_v1_frozen       # cash $4.64, below $5 min stake
+  - name: fade_tight           # cash $4.96, below $5 min stake
 
 engine:
   poll_interval_secs: 2

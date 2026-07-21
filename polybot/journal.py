@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS trades (
     slippage REAL,
     exit_kind TEXT,
     pnl_usd REAL,                  -- CLOSE only
+    -- GROSS price return, (exit-entry)/entry. Fees are NOT deducted here --
+    -- they are in pnl_usd. Never report pnl_pct beside a net figure without
+    -- saying so; use strategy_stats()'s *_net_pct for the after-fee number.
     pnl_pct REAL,                  -- CLOSE only
     reason TEXT,
     run_id TEXT,
@@ -129,7 +132,14 @@ CREATE TABLE IF NOT EXISTS paper_accounts (
     cash REAL NOT NULL,
     realized REAL NOT NULL,
     closes INTEGER NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    -- Total capital ever put into this account: starting_cash plus every
+    -- second-chance deposit. Return % MUST divide by this, never by a
+    -- hardcoded starting_cash, or a revival deposit reads as profit.
+    deposited REAL NOT NULL DEFAULT 100.0,
+    revivals INTEGER NOT NULL DEFAULT 0,
+    last_revival_ts REAL,       -- boundary: never pool pre- and post-revival results
+    retired_at REAL             -- set when a revived account dies again; entries stop
 );
 CREATE TABLE IF NOT EXISTS paper_positions (
     strategy TEXT NOT NULL,
@@ -263,6 +273,12 @@ _COLUMN_MIGRATIONS = {
         "weight": "REAL",
     },
     "paper_positions": {"entry_fee": "REAL NOT NULL DEFAULT 0"},
+    "paper_accounts": {
+        "deposited": "REAL NOT NULL DEFAULT 100.0",
+        "revivals": "INTEGER NOT NULL DEFAULT 0",
+        "last_revival_ts": "REAL",
+        "retired_at": "REAL",
+    },
     "signals": {
         "net_edge": "REAL", "fee": "REAL", "outcome": "TEXT",
         "anchor_price": "REAL", "anchor_model": "REAL", "model_delta": "REAL",
@@ -600,7 +616,8 @@ class Journal:
             return {}, []
         placeholders = ",".join("?" for _ in strategies)
         accounts = self.conn.execute(
-            f"SELECT strategy, cash, realized, closes FROM paper_accounts "
+            f"SELECT strategy, cash, realized, closes, deposited, revivals, "
+            f"last_revival_ts, retired_at FROM paper_accounts "
             f"WHERE strategy IN ({placeholders})", strategies,
         ).fetchall()
         positions = self.conn.execute(
@@ -619,13 +636,21 @@ class Journal:
         def save() -> None:
             for strategy in strategies:
                 self.conn.execute(
-                    """INSERT INTO paper_accounts (strategy, cash, realized, closes, updated_at)
-                       VALUES (?,?,?,?,?)
+                    """INSERT INTO paper_accounts
+                           (strategy, cash, realized, closes, updated_at,
+                            deposited, revivals, last_revival_ts, retired_at)
+                       VALUES (?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(strategy) DO UPDATE SET cash=excluded.cash,
                            realized=excluded.realized, closes=excluded.closes,
-                           updated_at=excluded.updated_at""",
+                           updated_at=excluded.updated_at,
+                           deposited=excluded.deposited, revivals=excluded.revivals,
+                           last_revival_ts=excluded.last_revival_ts,
+                           retired_at=excluded.retired_at""",
                     (strategy, broker.cash[strategy], broker.realized[strategy],
-                     broker.closes[strategy], now),
+                     broker.closes[strategy], now,
+                     broker.deposited[strategy], broker.revivals[strategy],
+                     broker.last_revival_ts.get(strategy),
+                     broker.retired_at.get(strategy)),
                 )
                 self.conn.execute("DELETE FROM paper_positions WHERE strategy = ?", (strategy,))
                 self.conn.executemany(
@@ -656,22 +681,51 @@ class Journal:
     # --------------------------------------------------------------- summaries
 
     def strategy_stats(self) -> list[dict]:
+        """Per-strategy round-trip summary, gross AND net of fees.
+
+        `pnl_pct` on a CLOSE row is the gross price return; the taker fees for
+        both legs live only in `pnl_usd`. So the net per-trade percentage has to
+        be rebuilt here by joining the CLOSE back to its OPEN for the entry
+        notional. Reporting the gross number next to a net account return is
+        what made a fleet averaging -5%/trade end up at -95% overall.
+        """
         rows = self.conn.execute(
-            """SELECT strategy,
-                      COUNT(*)                                     AS trades,
-                      SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
-                      COALESCE(SUM(pnl_usd), 0)                    AS pnl_usd,
-                      COALESCE(AVG(pnl_pct), 0)                    AS avg_pnl_pct,
-                      COALESCE(MAX(pnl_pct), 0)                    AS best_pct,
-                      COALESCE(MIN(pnl_pct), 0)                    AS worst_pct
-               FROM trades WHERE action = 'CLOSE'
-               GROUP BY strategy ORDER BY strategy"""
+            """SELECT c.strategy                                     AS strategy,
+                      COUNT(*)                                       AS trades,
+                      SUM(CASE WHEN c.pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                      COALESCE(SUM(c.pnl_usd), 0)                    AS pnl_usd,
+                      COALESCE(AVG(c.pnl_pct), 0)                    AS avg_pnl_pct,
+                      COALESCE(MAX(c.pnl_pct), 0)                    AS best_pct,
+                      COALESCE(MIN(c.pnl_pct), 0)                    AS worst_pct,
+                      AVG(c.pnl_usd / o.notional)                    AS avg_net_pct,
+                      MAX(c.pnl_usd / o.notional)                    AS best_net_pct,
+                      MIN(c.pnl_usd / o.notional)                    AS worst_net_pct,
+                      COUNT(o.notional)                              AS matched
+               FROM trades c
+               LEFT JOIN (SELECT trade_id, qty * price AS notional
+                          FROM trades WHERE action = 'OPEN' AND qty * price > 0) o
+                 ON o.trade_id = c.trade_id
+               WHERE c.action = 'CLOSE'
+               GROUP BY c.strategy ORDER BY c.strategy"""
         ).fetchall()
         return [
-            {"strategy": r[0], "trades": r[1], "wins": r[2] or 0, "pnl_usd": r[3],
-             "avg_pnl_pct": r[4], "best_pct": r[5], "worst_pct": r[6]}
+            {"strategy": r["strategy"], "trades": r["trades"], "wins": r["wins"] or 0,
+             "pnl_usd": r["pnl_usd"],
+             "avg_pnl_pct": r["avg_pnl_pct"], "best_pct": r["best_pct"],
+             "worst_pct": r["worst_pct"],
+             # None when no OPEN row could be matched (pre-trade_id history).
+             "avg_net_pct": r["avg_net_pct"], "best_net_pct": r["best_net_pct"],
+             "worst_net_pct": r["worst_net_pct"], "matched": r["matched"] or 0}
             for r in rows
         ]
+
+    def paper_capital(self) -> dict[str, dict]:
+        """Deposited capital and lifecycle state per strategy, for return math."""
+        rows = self.conn.execute(
+            """SELECT strategy, cash, deposited, revivals, last_revival_ts, retired_at
+               FROM paper_accounts"""
+        ).fetchall()
+        return {r["strategy"]: dict(r) for r in rows}
 
     def latest_equity(self) -> list[tuple[str, float]]:
         rows = self.conn.execute(

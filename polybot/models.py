@@ -25,6 +25,11 @@ class Market:
     game_pk: int | None = None   # MLB Stats API game id
     start_time: float | None = None  # scheduled first pitch, epoch seconds
     active: bool = True
+    # Venue taker fee coefficient for THIS market, straight from the gateway
+    # payload (fee = theta * qty * p * (1-p)). Reading it per market instead of
+    # trusting a config constant means the bot self-corrects if the exchange
+    # reprices a category. None -> fall back to engine.paper_taker_fee_theta.
+    fee_coefficient: float | None = None
 
     @property
     def key(self) -> str:
