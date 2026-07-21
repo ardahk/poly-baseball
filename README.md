@@ -16,13 +16,13 @@ Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 > **overall account return**; percentages only.
 
 <!-- STATS:START -->
-_Updated 2026-07-21 04:33 UTC · paper trading · percentages only · top 5 of qualifying strategies (≥10 closed trades)._
+_Updated 2026-07-21 04:34 UTC · paper trading · percentages only · top 5 of qualifying strategies (≥10 closed trades)._
 
 | | Strategy | Trades | Win % | Avg / Trade | Best Trade | Overall Return |
 |:--:|---|--:|--:|--:|--:|--:|
 | 🥇 | `news_late_v2` | 47 | 53% | +26.0% | +733% | **+66.9%** |
 | 🥈 | `settle_gap10_v2` | 40 | 38% | +19.4% | +567% | **+57.8%** |
-| 🥉 | `settle_away_v2` | 36 | 36% | -0.8% | +545% | **+27.9%** |
+| 🥉 | `settle_away_v2` | 36 | 36% | -0.8% | +545% | **+28.0%** |
 | ④ | `settle_gap05_early_v2` | 38 | 42% | +9.7% | +506% | **+13.1%** |
 | ⑤ | `cell_extras_home_v2` | 11 | 64% | +18.8% | +98% | **+7.4%** |
 
