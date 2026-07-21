@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Regenerate the README leaderboard from the live journal and push it if it
-# changed. Safe to run unattended from a systemd timer: it only ever touches
-# README.md, commits nothing else, and no-ops when the numbers are unchanged.
+# Regenerate the README leaderboard from the live journal and push it if the
+# standings actually moved. Safe to run unattended from a systemd timer: it only
+# ever touches README.md, commits nothing else, and makes no commit at all when
+# the numbers are unchanged (the updater leaves the file alone, timestamp
+# included, so a quiet offseason produces zero commits).
 #
 # Auth: relies on `gh auth setup-git` having configured the gh credential
 # helper for https://github.com (run once as the polybot user). No token is
@@ -21,7 +23,7 @@ fi
 "$PY" scripts/update_readme_stats.py
 
 if git diff --quiet -- README.md; then
-    echo "leaderboard unchanged; nothing to push."
+    echo "standings unchanged; no commit made."
     exit 0
 fi
 

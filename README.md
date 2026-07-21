@@ -16,15 +16,15 @@ Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 > **overall account return**; percentages only.
 
 <!-- STATS:START -->
-_Updated 2026-07-21 04:34 UTC · paper trading · percentages only · top 5 of qualifying strategies (≥10 closed trades)._
+_Paper trading · percentages only · top 5 of qualifying strategies (≥10 closed trades) · standings last changed 2026-07-21 04:46 UTC._
 
 | | Strategy | Trades | Win % | Avg / Trade | Best Trade | Overall Return |
 |:--:|---|--:|--:|--:|--:|--:|
-| 🥇 | `news_late_v2` | 47 | 53% | +26.0% | +733% | **+66.9%** |
-| 🥈 | `settle_gap10_v2` | 40 | 38% | +19.4% | +567% | **+57.8%** |
-| 🥉 | `settle_away_v2` | 36 | 36% | -0.8% | +545% | **+28.0%** |
+| 🥇 | `news_late_v2` | 49 | 53% | +27.1% | +733% | **+73.7%** |
+| 🥈 | `settle_gap10_v2` | 42 | 38% | +21.0% | +567% | **+64.0%** |
+| 🥉 | `settle_away_v2` | 37 | 35% | -3.4% | +545% | **+21.8%** |
 | ④ | `settle_gap05_early_v2` | 38 | 42% | +9.7% | +506% | **+13.1%** |
-| ⑤ | `cell_extras_home_v2` | 11 | 64% | +18.8% | +98% | **+7.4%** |
+| ⑤ | `cell_home_dog_v2` | 35 | 46% | +14.2% | +251% | **+8.7%** |
 
 **What each one does**
 
@@ -32,13 +32,14 @@ _Updated 2026-07-21 04:34 UTC · paper trading · percentages only · top 5 of q
 - 🥈 **`settle_gap10_v2`** — Holds a model-vs-market gap to settlement (one fee leg) — the preregistered rule, live.
 - 🥉 **`settle_away_v2`** — Holds away-side gaps to settlement — the model overrates home teams.
 - ④ **`settle_gap05_early_v2`** — Holds early-inning model-market gaps to settlement.
-- ⑤ **`cell_extras_home_v2`** — Buys the home last-at-bat advantage in extra innings.
+- ⑤ **`cell_home_dog_v2`** — Model-free: buys home underdogs in a fixed price band, held to settlement.
 <!-- STATS:END -->
 
 <sub>**Avg / Trade** = mean P&L per closed round trip · **Best Trade** = single
 best round trip · **Overall Return** = paper account vs. its starting bankroll.
 Small samples are noisy — strategies need a minimum number of closed trades to
-appear.</sub>
+appear. The job checks daily but only commits when the standings actually move,
+so the timestamp reflects the last real change, not the last check.</sub>
 
 ## How it trades
 

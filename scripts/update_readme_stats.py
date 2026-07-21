@@ -12,6 +12,7 @@ systemd timer (see scripts/update_readme.sh).
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,11 @@ from polybot.config import load_config  # noqa: E402
 from polybot.journal import Journal  # noqa: E402
 START = "<!-- STATS:START -->"
 END = "<!-- STATS:END -->"
+# The block is built with STAMP as a placeholder so two renders can be compared
+# ignoring the clock. A real timestamp is substituted only when the standings
+# themselves differ — otherwise an unchanged offseason would commit daily noise.
+STAMP = "@@STAMP@@"
+STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC")
 MEDALS = ["🥇", "🥈", "🥉", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"]
 
 # Short, plain-English "what it does" per strategy mechanism. v2 variants inherit
@@ -104,11 +110,10 @@ def build_block(db_path: str, starting_cash: float, top: int, min_trades: int) -
     rows.sort(key=lambda r: r["ret"], reverse=True)
     rows = rows[:top]
 
-    updated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         START,
-        f"_Updated {updated} · paper trading · percentages only · "
-        f"top {top} of qualifying strategies (≥{min_trades} closed trades)._",
+        f"_Paper trading · percentages only · top {top} of qualifying strategies "
+        f"(≥{min_trades} closed trades) · standings last changed {STAMP}._",
         "",
         "| | Strategy | Trades | Win % | Avg / Trade | Best Trade | Overall Return |",
         "|:--:|---|--:|--:|--:|--:|--:|",
@@ -148,13 +153,18 @@ def main() -> int:
         )
     pre = text[: text.index(START)]
     post = text[text.index(END) + len(END):]
-    new_text = pre + block + post
+    old_block = text[text.index(START): text.index(END) + len(END)]
 
-    if new_text != text:
-        readme_path.write_text(new_text)
-        print(f"README updated ({readme_path})")
-    else:
-        print("README already up to date")
+    # Compare with the old block's timestamp normalised back to the placeholder,
+    # so only a real change in the standings counts as a change.
+    if STAMP_RE.sub(STAMP, old_block) == block:
+        print("standings unchanged; README left untouched.")
+        return 0
+
+    stamped = block.replace(STAMP, datetime.now(timezone.utc)
+                            .strftime("%Y-%m-%d %H:%M UTC"))
+    readme_path.write_text(pre + stamped + post)
+    print(f"standings changed; README updated ({readme_path})")
     return 0
 
 
