@@ -19,15 +19,13 @@ Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 > when nothing has passed, this section says so instead.
 
 <!-- STATS:START -->
-_Paper trading · percentages only · net of fees · top 1 of strategies clearing the per-game bootstrap bar · standings last changed 2026-07-22 12:06 UTC._
+_Paper trading · percentages only · net of fees · last checked 2026-07-23 12:04 UTC._
 
-| | Strategy | Trades | Games | Win % | Net / Trade | Best Trade | Overall Return |
-|:--:|---|--:|--:|--:|--:|--:|--:|
-| 🥇 | `favorite_tail_hold_v3` | 11 | 11 | 100% | +8.9% | +12% | **+4.9%** |
+**No strategy has cleared the bar yet.** A strategy is only listed here once its per-game clustered mean P&L has a bootstrap 95% CI lower bound above zero — the same test [`scripts/prereg_eval.py`](scripts/prereg_eval.py) applies. 56 strategies currently qualify on trade count (≥10 closed) and **none** passes.
 
-**What each one does**
+Ranking by raw return would put a strategy on top whose entire edge is two or three lucky settlements, so the standings stay empty until something is actually distinguishable from luck.
 
-- 🥇 **`favorite_tail_hold_v3`** — —
+_Closest so far: `settle_gap10_v2` at +64.0% over 42 trades across 36 games — CI lower bound -0.1577/contract, still below zero._
 <!-- STATS:END -->
 
 <sub>**Net / Trade** = mean P&L per closed round trip *after* both taker fee
