@@ -19,11 +19,11 @@ Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 > when nothing has passed, this section says so instead.
 
 <!-- STATS:START -->
-_Paper trading · percentages only · net of fees · top 1 of strategies clearing the per-game bootstrap bar · standings last changed 2026-07-26 12:08 UTC._
+_Paper trading · percentages only · net of fees · top 1 of strategies clearing the per-game bootstrap bar · standings last changed 2026-07-27 12:07 UTC._
 
 | | Strategy | Trades | Games | Win % | Net / Trade | Best Trade | Overall Return |
 |:--:|---|--:|--:|--:|--:|--:|--:|
-| 🥇 | `favorite_tail_hold_v3` | 49 | 48 | 96% | +5.3% | +12% | **+13.0%** |
+| 🥇 | `favorite_tail_hold_v3` | 60 | 58 | 95% | +4.3% | +12% | **+12.9%** |
 
 **What each one does**
 
