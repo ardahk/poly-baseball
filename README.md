@@ -19,11 +19,11 @@ Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 > when nothing has passed, this section says so instead.
 
 <!-- STATS:START -->
-_Paper trading · percentages only · net of fees · top 1 of strategies clearing the per-game bootstrap bar · standings last changed 2026-08-08 12:12 UTC._
+_Paper trading · percentages only · net of fees · top 1 of strategies clearing the per-game bootstrap bar · standings last changed 2026-08-09 12:16 UTC._
 
 | | Strategy | Trades | Games | Win % | Net / Trade | Best Trade | Overall Return |
 |:--:|---|--:|--:|--:|--:|--:|--:|
-| 🥇 | `cell_leader_coinflip_v1` | 128 | 120 | 68% | +12.6% | +95% | **+82.0%** |
+| 🥇 | `cell_leader_coinflip_v1` | 136 | 127 | 68% | +11.8% | +95% | **+81.7%** |
 
 **What each one does**
 
