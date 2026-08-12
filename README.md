@@ -19,15 +19,13 @@ Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 > when nothing has passed, this section says so instead.
 
 <!-- STATS:START -->
-_Paper trading · percentages only · net of fees · top 1 of strategies clearing the per-game bootstrap bar · standings last changed 2026-08-11 12:17 UTC._
+_Paper trading · percentages only · net of fees · last checked 2026-08-12 12:21 UTC._
 
-| | Strategy | Trades | Games | Win % | Net / Trade | Best Trade | Overall Return |
-|:--:|---|--:|--:|--:|--:|--:|--:|
-| 🥇 | `cell_leader_coinflip_v1` | 144 | 135 | 67% | +10.0% | +95% | **+76.2%** |
+**No strategy has cleared the bar yet.** A strategy is only listed here once its per-game clustered mean P&L has a bootstrap 95% CI lower bound above zero — the same test [`scripts/prereg_eval.py`](scripts/prereg_eval.py) applies. 59 strategies currently qualify on trade count (≥10 closed) and **none** passes.
 
-**What each one does**
+Ranking by raw return would put a strategy on top whose entire edge is two or three lucky settlements, so the standings stay empty until something is actually distinguishable from luck.
 
-- 🥇 **`cell_leader_coinflip_v1`** — Buys actual leaders still priced near a coin flip — the market is slow to credit leads.
+_Closest so far: `cell_leader_coinflip_v1` at +74.5% over 155 trades across 145 games — CI lower bound -0.0127/contract, still below zero._
 <!-- STATS:END -->
 
 <sub>**Net / Trade** = mean P&L per closed round trip *after* both taker fee
