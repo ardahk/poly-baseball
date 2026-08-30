@@ -19,13 +19,15 @@ Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 > when nothing has passed, this section says so instead.
 
 <!-- STATS:START -->
-_Paper trading · percentages only · net of fees · last checked 2026-08-29 12:28 UTC._
+_Paper trading · percentages only · net of fees · top 1 of strategies clearing the per-game bootstrap bar · standings last changed 2026-08-30 12:27 UTC._
 
-**No strategy has cleared the bar yet.** A strategy is only listed here once its per-game clustered mean P&L has a bootstrap 95% CI lower bound above zero — the same test [`scripts/prereg_eval.py`](scripts/prereg_eval.py) applies. 59 strategies currently qualify on trade count (≥10 closed) and **none** passes.
+| | Strategy | Trades | Games | Win % | Net / Trade | Best Trade | Overall Return |
+|:--:|---|--:|--:|--:|--:|--:|--:|
+| 🥇 | `favorite_late_v2` | 449 | 425 | 92% | -0.2% | +16% | **-5.2%** |
 
-Ranking by raw return would put a strategy on top whose entire edge is two or three lucky settlements, so the standings stay empty until something is actually distinguishable from luck.
+**What each one does**
 
-_Closest so far: `cell_leader_coinflip_v1` at +74.8% over 209 trades across 198 games — CI lower bound -0.0063/contract, still below zero._
+- 🥇 **`favorite_late_v2`** — Buys heavy late-game favorites and holds to settlement (near-zero fee at the tails).
 <!-- STATS:END -->
 
 <sub>**Net / Trade** = mean P&L per closed round trip *after* both taker fee
