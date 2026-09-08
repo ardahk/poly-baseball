@@ -19,13 +19,17 @@ Runs continuously on an Oracle Cloud VM; the leaderboard below refreshes daily.
 > when nothing has passed, this section says so instead.
 
 <!-- STATS:START -->
-_Paper trading · percentages only · net of fees · last checked 2026-09-07 12:34 UTC._
+_Paper trading · percentages only · net of fees · top 2 of strategies clearing the per-game bootstrap bar · standings last changed 2026-09-08 12:31 UTC._
 
-**No strategy has cleared the bar yet.** A strategy is only listed here once its per-game clustered mean P&L has a bootstrap 95% CI lower bound above zero — the same test [`scripts/prereg_eval.py`](scripts/prereg_eval.py) applies. 59 strategies currently qualify on trade count (≥10 closed) and **none** passes.
+| | Strategy | Trades | Games | Win % | Net / Trade | Best Trade | Overall Return |
+|:--:|---|--:|--:|--:|--:|--:|--:|
+| 🥇 | `favorite_tail_hold_v3` | 429 | 414 | 93% | +0.7% | +12% | **+15.6%** |
+| 🥈 | `favorite_late_v2` | 536 | 510 | 92% | -0.1% | +16% | **-1.8%** |
 
-Ranking by raw return would put a strategy on top whose entire edge is two or three lucky settlements, so the standings stay empty until something is actually distinguishable from luck.
+**What each one does**
 
-_Closest so far: `news_late_v2` at +66.2% over 344 trades across 238 games — CI lower bound -0.0349/contract, still below zero._
+- 🥇 **`favorite_tail_hold_v3`** — —
+- 🥈 **`favorite_late_v2`** — Buys heavy late-game favorites and holds to settlement (near-zero fee at the tails).
 <!-- STATS:END -->
 
 <sub>**Net / Trade** = mean P&L per closed round trip *after* both taker fee
